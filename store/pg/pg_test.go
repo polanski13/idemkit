@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -527,5 +528,58 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	}
 	if count != waiters {
 		t.Fatalf("waiter count: %d, want %d", count, waiters)
+	}
+}
+
+func newBenchStore(b *testing.B) *pg.Store {
+	b.Helper()
+	if pkgPool == nil {
+		b.Skip("set IDEMKIT_PG_TEST_URL to run pg benchmarks")
+	}
+	if _, err := pkgPool.Exec(context.Background(), "TRUNCATE idemkit_keys"); err != nil {
+		b.Fatalf("truncate: %v", err)
+	}
+	return pg.New(pkgPool, pg.Config{
+		TTL:          time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: 10 * time.Millisecond,
+	})
+}
+
+func BenchmarkPG_Begin_Fresh(b *testing.B) {
+	s := newBenchStore(b)
+	ctx := context.Background()
+	hash := make([]byte, 32)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = s.Begin(ctx, strconv.Itoa(i), hash)
+	}
+}
+
+func BenchmarkPG_Begin_Done(b *testing.B) {
+	s := newBenchStore(b)
+	ctx := context.Background()
+	hash := make([]byte, 32)
+	_, _, tok, _ := s.Begin(ctx, "k", hash)
+	_ = s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200, Body: []byte("ok")})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = s.Begin(ctx, "k", hash)
+	}
+}
+
+func BenchmarkPG_Begin_Save_Roundtrip(b *testing.B) {
+	s := newBenchStore(b)
+	ctx := context.Background()
+	hash := make([]byte, 32)
+	res := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := strconv.Itoa(i)
+		_, _, tok, _ := s.Begin(ctx, key, hash)
+		_ = s.Save(ctx, key, tok, res)
 	}
 }

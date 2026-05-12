@@ -3,25 +3,29 @@
 [![CI](https://github.com/polanski13/idemkit/actions/workflows/ci.yml/badge.svg)](https://github.com/polanski13/idemkit/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/polanski13/idemkit.svg)](https://pkg.go.dev/github.com/polanski13/idemkit)
 
-> HTTP idempotency middleware for Go: length-prefixed body fingerprinting, true wait-for-in-progress, and pluggable storage.
+> HTTP idempotency middleware for Go: length-prefixed body fingerprinting, true wait-for-in-progress, and pluggable storage (in-memory + Postgres).
 
-> **Released as v0.1.0.** 0.x semver — API may shift before v1.0; pin to a specific version in production.
+> **Released as v0.2.0.** 0.x semver — API may shift before v1.0; pin to a specific version in production. See [CHANGELOG.md](CHANGELOG.md) for what changed since v0.1.0 (notably: generation tokens broke the `Store` interface; existing v0.1 custom backends need updating).
 
 ## What it does
 
-`idemkit` is a `net/http` middleware that gives any Go service idempotent `POST` / `PUT` / `PATCH` / `DELETE`. Same `Idempotency-Key` + same body → cached replay. Same key + different body → 422 conflict (Stripe-style). Concurrent duplicates → second waits for the first.
+`idemkit` is a `net/http` middleware that gives any Go service idempotent `POST` / `PUT` / `PATCH` / `DELETE`. Same `Idempotency-Key` + same body → cached replay. Same key + different body → 422 conflict (Stripe-style, configurable to IETF 409). Concurrent duplicates → second waits for the first.
 
-Shipping in v0.1:
+Shipping in v0.2:
 
 - `net/http` middleware
-- In-memory `Store` (single-instance, race-safe)
+- **In-memory `Store`** (single-instance, race-safe, zero non-stdlib deps) with optional proactive expiry janitor
+- **Postgres `Store`** (`store/pg`, pgx/v5 — cross-instance coordination via `INSERT ... ON CONFLICT` + row-based reclaim, polling `Wait`)
 - Length-prefixed request fingerprinting (method + path + query + body)
 - Streaming safe-skip on `http.Flusher` — the silent foot-gun every prior library misses
 - `MaxRequestBytes` / `MaxResponseBytes` caps
 - `KeyScope` for tenant isolation
-- Stripe-style 422 on body mismatch (configurable via `OnConflict`)
+- **Generation tokens** for safe `Save` under lock-timeout-reclaim race
+- **`Result.Clone()`** — defensive copying at store boundaries
+- Stripe-style 422 (`ConflictStripe`, default) or IETF draft-07 §2.6 409 (`ConflictIETF`) on body mismatch, both configurable via `OnConflict`
+- Conformance test suite documenting each mode's contract
 
-Out of scope for v0.1, see [Roadmap](#roadmap): Postgres store, Redis store, IETF conformance mode, generation tokens.
+Out of scope for v0.2, see [Roadmap](#roadmap): Redis store, opt-in LISTEN/NOTIFY for Postgres.
 
 ## Install
 
@@ -298,7 +302,7 @@ A: See [COMPARISON.md](COMPARISON.md). Short version: `idemkit` adds Postgres-fi
 | Version | Adds | Status |
 |---------|------|--------|
 | v0.1.0 | `net/http` middleware, in-mem store, fingerprinting, Stripe conflict, streaming safe-skip, threat model | ✅ released |
-| v0.2 | Postgres store, IETF conflict mode, chi example, conformance test suite, generation tokens for safe `Save` | next |
+| v0.2.0 | Postgres store, IETF conflict mode, chi example, conformance test suite, generation tokens, `Result.Clone()`, optional janitor for in-mem | ✅ released |
 | v0.3 | Redis store, opt-in LISTEN/NOTIFY (Postgres), opt-in Redis pub/sub | planned |
 | v1.0 | Stable API, semver guarantees | planned |
 

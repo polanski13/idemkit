@@ -154,16 +154,35 @@ The [COMPARISON.md](COMPARISON.md) table lists eight prior-art libraries. Only `
 
 The `store/pg` backend trades raw latency for cross-instance durability. Per-request cost includes one round trip to Postgres per `Store` method (Begin: 1–3 round trips, Save: 1, Release: 1, Wait: 1 per poll tick).
 
-A pg-vs-mem benchmark suite lives in `benchmarks/` alongside the velmie comparison. Headline numbers (medians, M4 with Postgres 16 running in Docker on the same host, default 100 ms `PollInterval`):
+Benchmarks live alongside the integration tests at `store/pg/pg_test.go` (`BenchmarkPG_*`). Reproduce:
 
-| Scenario | mem.Store | pg.Store | Δ |
-|---|--:|--:|---|
-| Replay (cache hit) | ~90 ns | TBD | TBD |
-| Begin + Save roundtrip | ~820 ns | TBD | TBD |
+```bash
+export IDEMKIT_PG_TEST_URL="postgres://postgres:postgres@localhost:5432/idemkit_bench?sslmode=disable"
+go test -run=^$ -bench=BenchmarkPG -benchmem -benchtime=2s ./store/pg/
+```
 
-Numbers will be filled in once a local benchmark run completes. Expected ranges: pg replay ~100-500 μs (single round trip + serialization); pg fresh ~200-1000 μs (2-3 round trips). Across a network link, multiply by RTT.
+Headline numbers (single warm run, Apple M4, Postgres 16 running in colima Docker on the same host, unix-socket-equivalent localhost networking):
 
-`pg.Store` overhead is dominated by Postgres' query latency, not by idemkit code. Tuning the Postgres connection pool (`pgxpool.Config.MaxConns`), running on the same VPC as the application, and using prepared statements (pgx does this automatically per connection) are the levers for production tuning.
+| Scenario | pg.Store ns/op | pg.Store B/op | pg.Store allocs/op | mem.Store ns/op (reference) | pg / mem |
+|---|--:|--:|--:|--:|--:|
+| `Begin` (Fresh) | ~548,000 | 589 | 15 | ~700 | ~780× |
+| `Begin` (Done, cache hit) | ~667,000 | 1,425 | 33 | ~90 | ~7,400× |
+| `Begin + Save` roundtrip | ~768,000 | 870 | 23 | ~820 | ~940× |
+
+### What this means in practice
+
+- **pg latency is dominated by Postgres query round-trip, not idemkit code.** ~500–800 μs per operation on localhost Docker is the floor; across a real network link, add per-hop RTT (typically 0.1–2 ms inside a VPC, more across regions).
+- **Cache hits (Begin Done) are more expensive than fresh claims** on pg because the cached `Result` is deserialised (JSON header + body bytes). On `mem.Store` cache hits are pointer-only.
+- **At 10K rps with `pgxpool.MaxConns: 30`** and ~700 μs average per call, each pool connection handles ~330 rps at ~23% utilisation. Sustainable; not bottlenecked.
+- **Production tuning**: pin `pgxpool` to the same VPC as the application, prefer unix sockets where possible (CSP-managed instances usually don't allow it), pre-warm the pool. pgx prepares statements automatically per connection.
+
+For sub-millisecond cache hits you want `mem.Store`. For cross-instance coordination at the cost of ~700 μs added per request, you want `pg.Store`.
+
+### Cross-backend benchmark caveats
+
+- **Single run, warm system.** The pg numbers don't have the 3-run median treatment the other benchmarks do — pg latency is dominated by Postgres' own scheduling, which has its own variance.
+- **Docker on the same host is not production.** Real deployments have network latency between app and DB. Add 0.1–2 ms per round trip.
+- **`PollInterval` doesn't affect these benchmarks** (no `Wait` calls in the bench set); the `Wait` blocking path is exercised in tests, not benchmarks.
 
 ## Not benchmarked yet (deferred to later releases)
 
