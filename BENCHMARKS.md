@@ -136,6 +136,20 @@ Median of 3 warm runs on the same hardware:
 - **No Redis comparison.** velmie's strong point is Redis support, which idemkit will only ship in v0.3. A Redis-vs-Redis comparison will be a v0.3 benchmark.
 - **Single-instance only.** Cross-instance coordination changes everything. These numbers are for the in-mem case.
 
+### Why only velmie?
+
+The [COMPARISON.md](COMPARISON.md) table lists eight prior-art libraries. Only `velmie/idempo` is benched here because the others can't produce honest apples-to-apples numbers:
+
+- **Fiber middleware, `furkandeveloper/idempotency-middleware` (Echo), `go-mizu/idempotency`** — framework-locked. Benchmarking them measures framework request overhead (Fiber's own routing, Echo's context allocation, etc.) on top of middleware cost. A "Fiber+idempotency vs net/http+idemkit" comparison would tell you whether to use Fiber, not whether to use a particular idempotency middleware. Different question.
+
+- **`ezraisw/idemgotent`, Fiber middleware, `furkandeveloper`, `go-mizu`** — no body-hash fingerprinting. These libraries cache responses by `Idempotency-Key` alone, which means a duplicate request with a *different body* will receive the cached response of the original. That's a correctness bug in the typical Stripe/IETF semantics, not a performance optimisation. Including them in a per-request timing chart would show them "faster" because they skip the SHA-256 — but the work they skip is the work that makes the cache safe. Comparing them on speed alone is misleading.
+
+- **`dhanapala-id/go-kit/idempotency`** — different semantics (409 fail-fast on concurrent duplicate, no wait-for-in-progress). Not comparable feature-set.
+
+- **`rafael-piovesan/go-rocket-ride`** — sample application accompanying Brandur's 2017 blog post, not an importable library. Architecturally interesting; can't `go get` it.
+
+`velmie/idempo` is the only library in the landscape that ships the same feature set: `net/http`-native, body-hash fingerprinting, opt-in wait-for-in-progress, framework-agnostic. The comparison numbers above are meaningful precisely because both libraries are doing the same work.
+
 ## Not benchmarked yet (deferred to v0.2+)
 
 - `mem.Store` under high lock contention (1000+ concurrent goroutines on one key) — the parallel bench tops out at GOMAXPROCS. A true contention benchmark would use synchronised goroutine fan-out.
