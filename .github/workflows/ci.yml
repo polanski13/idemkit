@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.22', 'stable']
+        go: ['1.25', 'stable']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
