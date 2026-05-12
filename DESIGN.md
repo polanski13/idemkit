@@ -298,20 +298,13 @@ type Store interface {
 
 Cost: two header-clone + body-copy operations per cache miss-and-fill cycle. Re-benchmark in v0.2; expected to be within the existing per-request budget.
 
-### 3. Waiter without `ctx.Deadline` can theoretically block forever
+### 3. ~~Waiter without `ctx.Deadline` can theoretically block forever~~ — closed in v0.2
 
-A blocked `Wait` exits via:
+**Resolved** by optional `JanitorInterval` in `mem.Config` (v0.2). When set to a positive duration, `New` spawns a background goroutine that periodically calls `purgeExpired` regardless of access patterns — closing waiter channels on expired entries and deleting them. Verified by `TestJanitor_WakesWaiterOnExpiredInFlightWithoutOtherTraffic`.
 
-- `Save` (channel close, returns result)
-- `Release` (channel close, returns nil)
-- `LockTimeout` expiration triggered by another `Begin` / `Wait` (channel close via `lookupLocked`, returns nil)
-- `ctx.Done()` (returns ctx error)
+`Store.Close() error` stops the goroutine cleanly (idempotent via `sync.Once`; noop when the janitor was never started). Recommended pattern: `defer store.Close()` at process shutdown, or `t.Cleanup` in tests.
 
-If none happen — no other caller touches the key, the original claim holder is stuck, the waiter's ctx has no deadline — the waiter blocks indefinitely. Pathological but possible.
-
-**Mitigation in v0.1:** document this and recommend `context.WithTimeout` for callers.
-
-**Fix in v0.2:** add an optional `JanitorInterval` to `mem.Config` for proactive expiry, which would close stale entries' waiter channels regardless of access patterns.
+Default remains `JanitorInterval: 0` (disabled) — preserves the v0.1 zero-goroutine semantics for callers who don't need proactive expiry. The pathology (waiter with no `ctx.Deadline`, no other traffic, janitor disabled) is still possible in that mode; the documented mitigation remains "always pass a bounded `ctx` to `Wait`".
 
 ### 4. Same idempotency-key reused across different endpoints produces 422
 

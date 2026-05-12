@@ -703,3 +703,98 @@ func BenchmarkBegin_Save_Roundtrip(b *testing.B) {
 		_ = s.Save(ctx, key, tok, res)
 	}
 }
+
+func TestJanitor_DisabledByDefaultCloseIsNoop(t *testing.T) {
+	s := mem.New(mem.Config{})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close on disabled janitor: %v", err)
+	}
+}
+
+func TestClose_IdempotentOnRepeatCalls(t *testing.T) {
+	s := mem.New(mem.Config{JanitorInterval: 10 * time.Millisecond})
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestJanitor_PurgesExpiredDoneEntries(t *testing.T) {
+	clock := newFakeClock()
+	s := mem.New(mem.Config{
+		TTL:             time.Second,
+		LockTimeout:     30 * time.Second,
+		Clock:           clock.Now,
+		JanitorInterval: 30 * time.Millisecond,
+	})
+	defer s.Close()
+
+	ctx := context.Background()
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Advance(2 * time.Second)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		state, _, _, _ := s.Begin(ctx, "k", []byte{1})
+		if state == idemkit.StateFresh {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("janitor did not purge expired entry within 500ms")
+}
+
+func TestJanitor_WakesWaiterOnExpiredInFlightWithoutOtherTraffic(t *testing.T) {
+	clock := newFakeClock()
+	s := mem.New(mem.Config{
+		TTL:             time.Hour,
+		LockTimeout:     time.Second,
+		Clock:           clock.Now,
+		JanitorInterval: 30 * time.Millisecond,
+	})
+	defer s.Close()
+
+	ctx := context.Background()
+	if _, _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	type out struct {
+		res *idemkit.Result
+		err error
+	}
+	done := make(chan out, 1)
+	go func() {
+		res, err := s.Wait(ctx, "k")
+		done <- out{res, err}
+	}()
+
+	select {
+	case got := <-done:
+		t.Fatalf("Wait returned prematurely: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	clock.Advance(2 * time.Second)
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Wait err: %v", got.err)
+		}
+		if got.res != nil {
+			t.Fatalf("Wait result: %v, want nil after janitor purge", got.res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("janitor did not wake waiter within 1s")
+	}
+}

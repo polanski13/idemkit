@@ -16,16 +16,20 @@ const (
 )
 
 type Config struct {
-	TTL         time.Duration
-	LockTimeout time.Duration
-	Clock       func() time.Time
+	TTL             time.Duration
+	LockTimeout     time.Duration
+	Clock           func() time.Time
+	JanitorInterval time.Duration
 }
 
 type Store struct {
-	cfg       Config
-	mu        sync.Mutex
-	entries   map[string]*entry
-	nextToken uint64
+	cfg         Config
+	mu          sync.Mutex
+	entries     map[string]*entry
+	nextToken   uint64
+	janitorStop chan struct{}
+	janitorDone chan struct{}
+	closeOnce   sync.Once
 }
 
 type entry struct {
@@ -47,7 +51,52 @@ func New(cfg Config) *Store {
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
 	}
-	return &Store{cfg: cfg, entries: make(map[string]*entry)}
+	s := &Store{cfg: cfg, entries: make(map[string]*entry)}
+	if cfg.JanitorInterval > 0 {
+		s.janitorStop = make(chan struct{})
+		s.janitorDone = make(chan struct{})
+		go s.runJanitor()
+	}
+	return s
+}
+
+func (s *Store) Close() error {
+	if s.janitorStop == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		close(s.janitorStop)
+		<-s.janitorDone
+	})
+	return nil
+}
+
+func (s *Store) runJanitor() {
+	defer close(s.janitorDone)
+	ticker := time.NewTicker(s.cfg.JanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.janitorStop:
+			return
+		case <-ticker.C:
+			s.purgeExpired()
+		}
+	}
+}
+
+func (s *Store) purgeExpired() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.cfg.Clock()
+	for key, e := range s.entries {
+		if now.After(e.expiresAt) {
+			if e.waiters != nil {
+				close(e.waiters)
+			}
+			delete(s.entries, key)
+		}
+	}
 }
 
 func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit.State, *idemkit.Result, idemkit.Token, error) {
