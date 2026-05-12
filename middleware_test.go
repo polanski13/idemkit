@@ -159,6 +159,22 @@ func TestMiddleware_BodyMismatchReturns422(t *testing.T) {
 	}
 }
 
+func TestMiddleware_BodyMismatchReturns409UnderIETFMode(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	})
+	cfg := idemkit.Config{ConflictMode: idemkit.ConflictIETF}
+	mw := idemkit.Middleware(newStore(), cfg)(h)
+
+	doRequest(t, mw, "POST", "/", "bodyA", "k1")
+	rec := doRequest(t, mw, "POST", "/", "bodyB", "k1")
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code: %d, want 409 (IETF draft-07 §2.6)", rec.Code)
+	}
+}
+
 func TestMiddleware_OnConflictCallbackOverridesDefault(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

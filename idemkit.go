@@ -139,7 +139,11 @@ func handleConflict(w http.ResponseWriter, r *http.Request, cfg *Config, reason 
 		cfg.OnConflict(w, r, reason)
 		return
 	}
-	http.Error(w, "idemkit: idempotency-key conflict ("+reason.String()+")", http.StatusUnprocessableEntity)
+	code := http.StatusUnprocessableEntity
+	if cfg.ConflictMode == ConflictIETF {
+		code = http.StatusConflict
+	}
+	http.Error(w, "idemkit: idempotency-key conflict ("+reason.String()+")", code)
 }
 
 func replay(w http.ResponseWriter, result *Result) {

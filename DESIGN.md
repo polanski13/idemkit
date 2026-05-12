@@ -222,6 +222,22 @@ w.Write(result.Body)
 
 **`X-Idemkit-Replayed: true`** is always set on replays. Use it in tests to verify caching is working.
 
+## Conflict semantics
+
+| Mode | Body-hash mismatch | Concurrent same-key+same-body | Reference |
+|------|--------------------|-------------------------------|-----------|
+| `ConflictStripe` (default) | **422 Unprocessable Entity** | wait + replay | [Stripe API docs](https://stripe.com/docs/api/idempotent_requests) |
+| `ConflictIETF` | **409 Conflict** | wait + replay | [draft-ietf-httpapi-idempotency-key-header-07 §2.6](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) |
+
+Both modes set `X-Idemkit-Replayed: true` on replays. `OnConflict` callback overrides both — if the caller wires their own conflict response, mode is irrelevant.
+
+**What's not in v0.2 from the IETF draft:**
+
+- RFC 7807 Problem Details response bodies. We emit `text/plain` errors via `http.Error`; callers wanting structured Problem Details should wire `OnConflict`.
+- Per-method validation of the key format (the draft is permissive about format; we don't enforce UUID-ness either).
+
+The substantive observable difference between modes is the conflict status code. Replay semantics, header handling, method filtering, and threat-model considerations are mode-independent.
+
 ## Deviations from the original plan
 
 The plan in `~/Downloads/idempotent-go-plan.md` is the design contract. Where the implementation diverges:
@@ -247,9 +263,14 @@ The plan's approach offers defense-in-depth against bodyHash collisions across s
 
 `Fingerprint.Scope` still exists as a public field and is honored by `Canonical()` — callers using `Fingerprint` directly can opt into scope-in-hash. The middleware does not.
 
-### 3. No `internal/conformance/` package in v0.1
+### 3. ~~No `internal/conformance/` package in v0.1~~ — closed in v0.2
 
-The plan promised `internal/conformance/stripe_test.go` and `internal/conformance/ietf_draft07_test.go`. The Stripe semantics are exercised by `middleware_test.go` instead; the IETF conformance suite lands in v0.2 alongside `ConflictIETF` implementation.
+**Resolved** alongside `ConflictIETF` (v0.2). Both spec-conformance suites live in `internal/conformance/`:
+
+- `stripe_test.go` — Stripe semantics (422 on body-hash mismatch; replay on match; wait on concurrent duplicate; replay header present; cross-key isolation).
+- `ietf_draft07_test.go` — IETF draft-07 §2.6 (409 on body-hash mismatch; otherwise identical to Stripe replay/wait semantics; no-key pass-through for permitted methods).
+
+Tests share fixtures via `helpers_test.go`. The suite isolates "what each mode actually promises" from `middleware_test.go`'s integration coverage. If draft-08 lands and changes semantics, a new `ietf_draft08_test.go` file is added; the older draft file is preserved for regression tracking until that draft sunsets.
 
 ## Known limitations
 

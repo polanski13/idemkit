@@ -225,8 +225,8 @@ Zero values are replaced with defaults at `Middleware` construction time. To opt
 
 ## Conformance
 
-- **Stripe semantics** — 422 on body mismatch, replay on match, wait on concurrent duplicate. The default and only mode shipped in v0.1.
-- **IETF `draft-ietf-httpapi-idempotency-key-header-07`** — v0.2. `ConflictMode: ConflictIETF` is reserved in the API and currently falls back to Stripe semantics with a warning logged.
+- **Stripe semantics** (default, `ConflictMode: ConflictStripe`) — 422 Unprocessable Entity on body-hash mismatch, replay on match, wait on concurrent duplicate. Tested in [`internal/conformance/stripe_test.go`](internal/conformance/stripe_test.go).
+- **IETF `draft-ietf-httpapi-idempotency-key-header-07`** (`ConflictMode: ConflictIETF`) — 409 Conflict on body-hash mismatch per §2.6, otherwise identical replay/wait semantics. Tested in [`internal/conformance/ietf_draft07_test.go`](internal/conformance/ietf_draft07_test.go). What's not (yet) implemented from the draft: RFC 7807 Problem Details response bodies, per-method validation. Status-code conformance is the substantive difference; the rest of the middleware (Methods filter, KeyScope, replay headers) is mode-independent and equally compliant under either mode.
 
 ## FAQ
 
