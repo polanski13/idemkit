@@ -10,9 +10,10 @@ github.com/polanski13/idemkit              # Middleware, Config, Fingerprint, St
                                            # DefaultHasher
 github.com/polanski13/idemkit/store/mem    # mem.Store, mem.Config, mem.New
 github.com/polanski13/idemkit/store/pg     # pg.Store, pg.Config, pg.New, pg.ApplySchema (v0.2)
+github.com/polanski13/idemkit/store/redis  # redis.Store, redis.Config, redis.New (v0.3)
 ```
 
-Subpackages are added when there is something to put in them. `store/redis` lands in v0.3. No `adapter/chi`, `adapter/gin`, `adapter/echo` packages — for chi/gin the middleware composes as `r.Use(idemkit.Middleware(...))` with no glue needed. Echo and Fiber have different handler shapes and could warrant small adapter packages post-v1.0 if there's demand.
+Subpackages are added when there is something to put in them. No `adapter/chi`, `adapter/gin`, `adapter/echo` packages — for chi/gin the middleware composes as `r.Use(idemkit.Middleware(...))` with no glue needed. Echo and Fiber have different handler shapes and could warrant small adapter packages post-v1.0 if there's demand.
 
 ## Fingerprint: length-prefixed framing
 
@@ -123,6 +124,86 @@ A single Postgres `SEQUENCE` (`idemkit_token_seq`) hands out globally unique BIG
 ### Why no advisory locks
 
 The plan considered `pg_try_advisory_xact_lock` as a secondary fence. `hashtext(key)` collides under high cardinality (int4 keyspace, 32-bit hash). The two-int4 form (`pg_try_advisory_xact_lock(int4, int4)`) fed with the first and last 32 bits of SHA-256(key) gives 64-bit collision resistance — but the row-based claim with `FOR UPDATE` already serialises operations correctly. Advisory locks add overhead for no correctness gain. Documented; not implemented.
+
+## Redis store (v0.3)
+
+`store/redis` implements `idemkit.Store` on top of `github.com/redis/go-redis/v9`. Same behavioural contract as `mem.Store` and `pg.Store`, with state durably persisted in Redis and cross-instance coordination via Redis's atomic operations.
+
+### Storage layout
+
+Each idempotency key maps to a single Redis hash at `<KeyPrefix><key>` (`KeyPrefix` defaults to `"idemkit:"`). Fields:
+
+| Field | Meaning |
+|-------|---------|
+| `state` | `"0"` (in-flight) or `"1"` (done) |
+| `token` | Decimal-string-encoded `uint64` |
+| `body_hash` | Raw bytes of the request fingerprint |
+| `response_code` | Decimal-string-encoded HTTP status |
+| `response_headers` | JSON-encoded `http.Header` |
+| `response_body` | Raw bytes of the captured response body |
+
+The whole hash is governed by a single TTL via `PEXPIRE` (millisecond precision). All four operations (Begin, Save, Release, Wait) touch only this one key — every Lua script in this store is single-key, which keeps the implementation Redis Cluster–compatible without hash tags.
+
+### Begin
+
+Single Lua script:
+
+1. `EXISTS key` → 0: `HSET` state="0", token=NEW, body_hash=BODY; `PEXPIRE` with `LockTimeout`; return `{'fresh'}`.
+2. Otherwise `HMGET` state, body_hash, response_code, response_headers, response_body and return `{'existing', ...}`.
+
+A `nilSafe` helper coerces Redis `nil` returns to empty strings before tabling, because Lua's `{a, nil, c}` truncates at the first nil and the Go decoder needs a fixed-arity reply. The Go side then decodes the `existing` reply into the correct `State` + cached `Result` (if Done) + `ErrBodyMismatch` (if hashes differ).
+
+Atomicity matters: under concurrent `Begin` calls, exactly one will see `EXISTS==0` and create the entry. Lua scripts in Redis are single-threaded relative to other commands on that node — `TestConcurrentClaim_ExactlyOneSeesFresh` verifies this with 20 goroutines.
+
+### Token generation
+
+Tokens are 64-bit values from `crypto/rand` (re-rolled on the 1-in-2^64 chance of zero, which is the "no claim" sentinel). No counter key, no sequence to maintain.
+
+This deviates from `store/pg`, which uses a Postgres `SEQUENCE`. Postgres has cheap, MVCC-aware sequences; Redis does not, and a counter key would introduce a second slot to coordinate in Cluster mode (forcing hash tags or accepting cross-slot script limitations). Random `uint64` tokens sidestep both — collision probability over realistic claim volumes is negligible.
+
+### Wait
+
+Polling-based, default 100 ms (same default as `store/pg`). Each tick: `HMGET` state, response_code, response_headers, response_body. Branches:
+
+- All-nil reply (the key doesn't exist — expired by TTL or removed by `Release`) → return `(nil, nil)`. Caller retries `Begin`.
+- `state="0"` (in-flight) → sleep `PollInterval`, repeat.
+- `state="1"` (done) → decode `response_*` fields into `Result`, return.
+
+`ctx.Done()` interrupts the sleep cleanly with `ctx.Err()`.
+
+Pub/sub overlay (issue #11) is opt-in for v0.3 — when enabled, the poll loop races a notify-chan against the polling tick. Polling stays as the correctness backstop because Redis pub/sub has no persistence.
+
+### Save
+
+Single Lua script:
+
+1. `HGET token` → if nil or mismatches `ARGV[1]`, return `'tokenmismatch'`.
+2. `HSET` state="1", response_*; `PEXPIRE` with `TTL` (not `LockTimeout` — the entry is now Done).
+3. Return `'ok'`.
+
+Go translates `'tokenmismatch'` to `idemkit.ErrTokenMismatch`. Same contract as `pg.Save` and `mem.Save`.
+
+### Release
+
+Single Lua script: `HGET token`, verify, `DEL` on match. Mismatched or missing token is a silent no-op (per `idemkit.Store` contract).
+
+### TTL handling and lock-timeout reclaim
+
+Postgres tracks `expires_at` as a column and enforces it via `WHERE expires_at > NOW()` filters; reclaiming an expired-in-flight row needs `SELECT FOR UPDATE` to overwrite it in place. Redis handles this natively: the hash carries the `LockTimeout`-derived TTL while in-flight, and the `TTL`-derived TTL after Save. When a stuck-in-flight key passes its lock timeout, Redis evicts it on its own clock; the next `Begin` sees `EXISTS==0` and claims fresh. No reclaim path, no `SELECT FOR UPDATE` equivalent. `TestLockTimeout_ExpiredInFlightIsReclaimable` and `TestTTL_ExpiredDoneEntryIsReclaimable` cover both flows.
+
+### Why no `WATCH`/`MULTI`/`EXEC`
+
+Optimistic concurrency via `WATCH` is the alternative to Lua. Trade-offs:
+
+- `WATCH` retries on contention; Lua does not (scripts are atomic).
+- `WATCH` spreads logic across multiple Go-side round trips; Lua inlines it in one.
+- For 4 operations × small payload, Lua's single-RTT path is both simpler and faster.
+
+Lua scripts are loaded by go-redis on first call and reused by SHA on subsequent calls (`EVALSHA`).
+
+### Cluster compatibility
+
+Every Lua script in `store/redis` takes exactly one key. Redis Cluster routes the script to the right slot by that key — no multi-key scripts, no hash tags needed. `Sentinel`, `Ring`, and `ClusterClient` are supported transparently via `redis.UniversalClient` in the constructor signature.
 
 ## Response capture: pass-through + drop on streaming
 
