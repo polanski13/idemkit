@@ -78,6 +78,48 @@ curl -X POST -i -H "Idempotency-Key: ch_001" http://localhost:8080/v1/charges
 
 Full runnable example: [examples/nethttp/main.go](examples/nethttp/main.go).
 
+## Quickstart (chi)
+
+A runnable chi example lives in [examples/chi](examples/chi). It uses a separate Go module so chi stays out of the core `idemkit` dependency graph.
+
+```bash
+cd examples/chi
+go run .
+```
+
+In another terminal, send the same idempotency key and body twice:
+
+```bash
+curl -i -X POST http://localhost:8080/v1/charges \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ch_001" \
+  -H "X-Tenant-ID: tenant_a" \
+  -d '{"amount":1000}'
+# 201 Created
+# {"id":"ch_1715533101...","status":"succeeded"}
+
+curl -i -X POST http://localhost:8080/v1/charges \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ch_001" \
+  -H "X-Tenant-ID: tenant_a" \
+  -d '{"amount":1000}'
+# Same ID. Response includes header:  X-Idemkit-Replayed: true
+```
+
+A replay with the same key but a different body returns the default Stripe-style conflict:
+
+```bash
+curl -i -X POST http://localhost:8080/v1/charges \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ch_001" \
+  -H "X-Tenant-ID: tenant_a" \
+  -d '{"amount":2000}'
+# 422 Unprocessable Entity
+# idemkit: idempotency-key conflict (body_mismatch)
+```
+
+`X-Tenant-ID` is read by the example's fake auth middleware and passed to `Config.KeyScope`, isolating identical keys per tenant.
+
 ## Quickstart (Postgres)
 
 ```go
