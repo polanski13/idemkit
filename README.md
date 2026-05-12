@@ -5,7 +5,7 @@
 
 > HTTP idempotency middleware for Go: length-prefixed body fingerprinting, true wait-for-in-progress, and pluggable storage.
 
-> **v0.1 work-in-progress.** Not yet released. API may shift before v1.0.
+> **Released as v0.1.0.** 0.x semver — API may shift before v1.0; pin to a specific version in production.
 
 ## What it does
 
@@ -208,12 +208,12 @@ A: See [COMPARISON.md](COMPARISON.md). Short version: `idemkit` adds Postgres-fi
 
 ## Roadmap
 
-| Version | Adds | Target |
+| Version | Adds | Status |
 |---------|------|--------|
-| v0.1 (in progress) | `net/http` middleware, in-mem store, fingerprinting, Stripe conflict, streaming safe-skip, threat model | Week 10 |
-| v0.2 | Postgres store, IETF conflict mode, chi example, conformance test suite, generation tokens for safe `Save` | Week 16 |
-| v0.3 | Redis store, opt-in LISTEN/NOTIFY (Postgres), opt-in Redis pub/sub | Week 22 |
-| v1.0 | Stable API, semver guarantees | Week 26 |
+| v0.1.0 | `net/http` middleware, in-mem store, fingerprinting, Stripe conflict, streaming safe-skip, threat model | ✅ released |
+| v0.2 | Postgres store, IETF conflict mode, chi example, conformance test suite, generation tokens for safe `Save` | next |
+| v0.3 | Redis store, opt-in LISTEN/NOTIFY (Postgres), opt-in Redis pub/sub | planned |
+| v1.0 | Stable API, semver guarantees | planned |
 
 Out of scope for v1.0: Prometheus / OpenTelemetry hooks (use the `Logger` field and your own observability stack), request-body streaming, custom codecs.
 
