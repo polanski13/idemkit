@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -20,6 +21,7 @@ const (
 	defaultLockTimeout  = 30 * time.Second
 	defaultPollInterval = 100 * time.Millisecond
 	defaultKeyPrefix    = "idemkit:"
+	notifySuffix        = "notify"
 
 	stateInFlight = "0"
 	stateDone     = "1"
@@ -30,11 +32,14 @@ type Config struct {
 	LockTimeout  time.Duration
 	PollInterval time.Duration
 	KeyPrefix    string
+	PubSub       bool
 }
 
 type Store struct {
-	client goredis.UniversalClient
-	cfg    Config
+	client    goredis.UniversalClient
+	cfg       Config
+	sub       *subscriber
+	closeOnce sync.Once
 }
 
 func New(client goredis.UniversalClient, cfg Config) *Store {
@@ -50,7 +55,33 @@ func New(client goredis.UniversalClient, cfg Config) *Store {
 	if cfg.KeyPrefix == "" {
 		cfg.KeyPrefix = defaultKeyPrefix
 	}
-	return &Store{client: client, cfg: cfg}
+	s := &Store{client: client, cfg: cfg}
+	if cfg.PubSub {
+		s.sub = newSubscriber(client, s.notifyChannel())
+	}
+	return s
+}
+
+func (s *Store) Close() error {
+	if s.sub == nil {
+		return nil
+	}
+	var err error
+	s.closeOnce.Do(func() {
+		err = s.sub.close()
+	})
+	return err
+}
+
+func (s *Store) notifyChannel() string {
+	return s.cfg.KeyPrefix + notifySuffix
+}
+
+func (s *Store) publishArgs(key string) (string, string) {
+	if !s.cfg.PubSub {
+		return "", ""
+	}
+	return s.notifyChannel(), key
 }
 
 var beginScript = goredis.NewScript(`
@@ -80,6 +111,9 @@ redis.call('HSET', key,
     'response_headers', ARGV[4],
     'response_body', ARGV[5])
 redis.call('PEXPIRE', key, ARGV[6])
+if ARGV[7] ~= '' then
+    redis.call('PUBLISH', ARGV[7], ARGV[8])
+end
 return 'ok'
 `)
 
@@ -90,6 +124,9 @@ if not stored or stored ~= ARGV[1] then
     return 0
 end
 redis.call('DEL', key)
+if ARGV[2] ~= '' then
+    redis.call('PUBLISH', ARGV[2], ARGV[3])
+end
 return 1
 `)
 
@@ -152,6 +189,11 @@ func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit
 
 func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
 	fullKey := s.cfg.KeyPrefix + key
+	var notify chan struct{}
+	if s.sub != nil {
+		notify = s.sub.register(key)
+		defer s.sub.unregister(key, notify)
+	}
 	for {
 		result, terminal, err := s.probe(ctx, fullKey)
 		if err != nil {
@@ -163,6 +205,7 @@ func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-notify:
 		case <-time.After(s.cfg.PollInterval):
 		}
 	}
@@ -204,6 +247,7 @@ func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, resul
 		body = []byte{}
 	}
 	fullKey := s.cfg.KeyPrefix + key
+	notifyChan, notifyKey := s.publishArgs(key)
 	raw, err := saveScript.Run(ctx, s.client, []string{fullKey},
 		strconv.FormatUint(uint64(token), 10),
 		stateDone,
@@ -211,6 +255,8 @@ func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, resul
 		headerBytes,
 		body,
 		ttlMillis,
+		notifyChan,
+		notifyKey,
 	).Result()
 	if err != nil {
 		return fmt.Errorf("idemkit/redis: save: %w", err)
@@ -227,8 +273,11 @@ func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, resul
 
 func (s *Store) Release(ctx context.Context, key string, token idemkit.Token) error {
 	fullKey := s.cfg.KeyPrefix + key
+	notifyChan, notifyKey := s.publishArgs(key)
 	_, err := releaseScript.Run(ctx, s.client, []string{fullKey},
 		strconv.FormatUint(uint64(token), 10),
+		notifyChan,
+		notifyKey,
 	).Result()
 	if err != nil {
 		return fmt.Errorf("idemkit/redis: release: %w", err)

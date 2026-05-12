@@ -545,6 +545,242 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	}
 }
 
+func newPubSubStore(t *testing.T, pollInterval time.Duration) *redis.Store {
+	t.Helper()
+	if pkgClient == nil {
+		t.Skip("set IDEMKIT_REDIS_TEST_URL to run redis integration tests")
+	}
+	if err := pkgClient.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+	s := redis.New(pkgClient, redis.Config{
+		TTL:          time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: pollInterval,
+		PubSub:       true,
+	})
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return s
+}
+
+func TestPubSub_WakesWaiterOnSave(t *testing.T) {
+	s := newPubSubStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	type out struct {
+		res *idemkit.Result
+		err error
+		dur time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		started := time.Now()
+		res, err := s.Wait(ctx, "k")
+		done <- out{res, err, time.Since(started)}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("err: %v", got.err)
+		}
+		if !reflect.DeepEqual(got.res, saved) {
+			t.Fatalf("result: %#v, want %#v", got.res, saved)
+		}
+		if got.dur >= 500*time.Millisecond {
+			t.Fatalf("Wait took %v, expected pub/sub-driven wakeup well under PollInterval (5s)", got.dur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after Save")
+	}
+}
+
+func TestPubSub_WakesWaiterOnRelease(t *testing.T) {
+	s := newPubSubStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	type out struct {
+		res *idemkit.Result
+		err error
+		dur time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		started := time.Now()
+		res, err := s.Wait(ctx, "k")
+		done <- out{res, err, time.Since(started)}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if err := s.Release(ctx, "k", tok); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("err: %v", got.err)
+		}
+		if got.res != nil {
+			t.Fatalf("result: %v, want nil after Release", got.res)
+		}
+		if got.dur >= 500*time.Millisecond {
+			t.Fatalf("Wait took %v, expected pub/sub-driven wakeup well under PollInterval (5s)", got.dur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after Release")
+	}
+}
+
+func TestPubSub_KeyPrefixIsolatesChannels(t *testing.T) {
+	if pkgClient == nil {
+		t.Skip("set IDEMKIT_REDIS_TEST_URL to run redis integration tests")
+	}
+	if err := pkgClient.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+	cfgBase := redis.Config{
+		TTL:          time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: 5 * time.Second,
+		PubSub:       true,
+	}
+	cfgA := cfgBase
+	cfgA.KeyPrefix = "tenantA:"
+	cfgB := cfgBase
+	cfgB.KeyPrefix = "tenantB:"
+	sA := redis.New(pkgClient, cfgA)
+	sB := redis.New(pkgClient, cfgB)
+	t.Cleanup(func() { _ = sA.Close(); _ = sB.Close() })
+
+	ctx := context.Background()
+	_, _, tokA, _ := sA.Begin(ctx, "k", []byte{1})
+	_, _, _, _ = sB.Begin(ctx, "k", []byte{1})
+
+	doneB := make(chan struct{}, 1)
+	go func() {
+		_, _ = sB.Wait(ctx, "k")
+		doneB <- struct{}{}
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	if err := sA.Save(ctx, "k", tokA, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-doneB:
+		t.Fatal("sB.Wait woke up on sA's publish — channels not isolated by KeyPrefix")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestPubSub_CloseIsIdempotent(t *testing.T) {
+	if pkgClient == nil {
+		t.Skip("set IDEMKIT_REDIS_TEST_URL to run redis integration tests")
+	}
+	if err := pkgClient.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+	s := redis.New(pkgClient, redis.Config{PubSub: true})
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestPubSub_CloseWithoutPubSubIsNoop(t *testing.T) {
+	if pkgClient == nil {
+		t.Skip("set IDEMKIT_REDIS_TEST_URL to run redis integration tests")
+	}
+	s := redis.New(pkgClient, redis.Config{})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close on non-pubsub store: %v", err)
+	}
+}
+
+func TestPubSub_WaitHonorsCtxCancellation(t *testing.T) {
+	s := newPubSubStore(t, 5*time.Second)
+	if _, _, _, err := s.Begin(context.Background(), "k", []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.Wait(ctx, "k")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err: %v, want context.Canceled", err)
+	}
+}
+
+func TestPubSub_ConcurrentWaitersAllWake(t *testing.T) {
+	s := newPubSubStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	const waiters = 10
+	results := make(chan *idemkit.Result, waiters)
+	var wg sync.WaitGroup
+	wg.Add(waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			defer wg.Done()
+			res, err := s.Wait(ctx, "k")
+			if err != nil {
+				t.Errorf("Wait: %v", err)
+				return
+			}
+			results <- res
+		}()
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	started := time.Now()
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(started)
+	close(results)
+
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("waiters took %v to wake, expected pub/sub-driven wakeup well under PollInterval (5s)", elapsed)
+	}
+
+	count := 0
+	for got := range results {
+		count++
+		if !reflect.DeepEqual(got, saved) {
+			t.Errorf("waiter received %#v, want %#v", got, saved)
+		}
+	}
+	if count != waiters {
+		t.Fatalf("waiter count: %d, want %d", count, waiters)
+	}
+}
+
 func newBenchStore(b *testing.B) *redis.Store {
 	b.Helper()
 	if pkgClient == nil {

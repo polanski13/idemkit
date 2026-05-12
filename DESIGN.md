@@ -169,9 +169,19 @@ Polling-based, default 100 ms (same default as `store/pg`). Each tick: `HMGET` s
 - `state="0"` (in-flight) → sleep `PollInterval`, repeat.
 - `state="1"` (done) → decode `response_*` fields into `Result`, return.
 
-`ctx.Done()` interrupts the sleep cleanly with `ctx.Err()`.
+`ctx.Done()` interrupts the sleep cleanly with `ctx.Err()`. Pub/sub overlay is opt-in via `Config.PubSub`; see "Pub/sub overlay" below.
 
-Pub/sub overlay (issue #11) is opt-in for v0.3 — when enabled, the poll loop races a notify-chan against the polling tick. Polling stays as the correctness backstop because Redis pub/sub has no persistence.
+### Pub/sub overlay
+
+When `Config.PubSub` is `true`, `New` spawns a subscriber goroutine that `SUBSCRIBE`s to a single notify channel derived from `KeyPrefix` (default channel: `idemkit:notify`). `Save` and `Release` extend their Lua scripts to `PUBLISH <channel> <bareKey>` after the state mutation; when `PubSub` is disabled, the channel ARGV is passed as `""` and the script's `if ARGV[n] ~= ''` guard skips the publish entirely. One set of scripts, both modes.
+
+`Wait` registers a per-call buffered (size 1) notify chan with the subscriber, then `select`s over `notify-chan`, `polling-tick`, and `ctx.Done()` inside the probe loop. The notify chan is unregistered via `defer` when `Wait` returns. Multiple goroutines waiting on the same key each register their own chan; the subscriber's dispatcher non-blocking-sends to all of them on each published payload.
+
+**Why polling stays.** Redis pub/sub has no persistence — a subscriber that drops or reconnects loses any messages emitted during the gap. Polling remains the source of truth; pub/sub is purely a latency hint that short-circuits the polling tick when a relevant event arrives. The architecture cannot become silently incorrect by losing notifications.
+
+**Channel isolation.** The notify channel is derived from `KeyPrefix`, so two stores configured with different prefixes on the same Redis broadcast on different channels and don't observe each other's events. Verified by `TestPubSub_KeyPrefixIsolatesChannels`.
+
+**Lifecycle.** `Store.Close()` stops the subscriber goroutine: close a stop-chan, `pubsub.Close()` on the go-redis subscription (releases the dedicated connection), then `<-done` for orderly shutdown. Idempotent via `sync.Once`; a no-op when `PubSub` is disabled. Recommended pattern: `defer store.Close()` at process shutdown, or `t.Cleanup` in tests.
 
 ### Save
 
