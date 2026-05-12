@@ -3,19 +3,20 @@
 [![CI](https://github.com/polanski13/idemkit/actions/workflows/ci.yml/badge.svg)](https://github.com/polanski13/idemkit/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/polanski13/idemkit.svg)](https://pkg.go.dev/github.com/polanski13/idemkit)
 
-> HTTP idempotency middleware for Go: length-prefixed body fingerprinting, true wait-for-in-progress, and pluggable storage (in-memory + Postgres).
+> HTTP idempotency middleware for Go: length-prefixed body fingerprinting, true wait-for-in-progress, and pluggable storage (in-memory, Postgres, Redis).
 
-> **Released as v0.2.0.** 0.x semver — API may shift before v1.0; pin to a specific version in production. See [CHANGELOG.md](CHANGELOG.md) for what changed since v0.1.0 (notably: generation tokens broke the `Store` interface; existing v0.1 custom backends need updating).
+> **Released as v0.3.0.** 0.x semver — API may shift before v1.0; pin to a specific version in production. v0.3 ships additively on top of v0.2; the `Store` interface and existing `Config` fields are unchanged. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ## What it does
 
 `idemkit` is a `net/http` middleware that gives any Go service idempotent `POST` / `PUT` / `PATCH` / `DELETE`. Same `Idempotency-Key` + same body → cached replay. Same key + different body → 422 conflict (Stripe-style, configurable to IETF 409). Concurrent duplicates → second waits for the first.
 
-Shipping in v0.2:
+Shipping in v0.3:
 
 - `net/http` middleware
 - **In-memory `Store`** (single-instance, race-safe, zero non-stdlib deps) with optional proactive expiry janitor
-- **Postgres `Store`** (`store/pg`, pgx/v5 — cross-instance coordination via `INSERT ... ON CONFLICT` + row-based reclaim, polling `Wait`)
+- **Postgres `Store`** (`store/pg`, pgx/v5 — cross-instance coordination via `INSERT ... ON CONFLICT` + row-based reclaim, polling `Wait`, opt-in LISTEN/NOTIFY)
+- **Redis `Store`** (`store/redis`, go-redis/v9 — Lua-scripted single-RTT atomic `Begin`/`Save`/`Release`, polling `Wait`, opt-in pub/sub overlay; Cluster-compatible without hash tags)
 - Length-prefixed request fingerprinting (method + path + query + body)
 - Streaming safe-skip on `http.Flusher` — the silent foot-gun every prior library misses
 - `MaxRequestBytes` / `MaxResponseBytes` caps
@@ -25,15 +26,13 @@ Shipping in v0.2:
 - Stripe-style 422 (`ConflictStripe`, default) or IETF draft-07 §2.6 409 (`ConflictIETF`) on body mismatch, both configurable via `OnConflict`
 - Conformance test suite documenting each mode's contract
 
-Out of scope for v0.2, see [Roadmap](#roadmap): Redis store, opt-in LISTEN/NOTIFY for Postgres.
-
 ## Install
 
 ```bash
 go get github.com/polanski13/idemkit
 ```
 
-Requires Go 1.25 or later. The core `idemkit` package and `store/mem` have zero non-stdlib runtime dependencies. Backend subpackages (`store/pg`) bring their own driver as a direct dep (`github.com/jackc/pgx/v5`); users who only need in-memory storage don't link it.
+Requires Go 1.25 or later. The core `idemkit` package and `store/mem` have zero non-stdlib runtime dependencies. Backend subpackages bring their own driver as a direct dep (`store/pg` → `github.com/jackc/pgx/v5`, `store/redis` → `github.com/redis/go-redis/v9`); users who only need in-memory storage don't link either.
 
 ## Quickstart
 
@@ -167,7 +166,70 @@ func main() {
 
 The schema is in [store/pg/schema.sql](store/pg/schema.sql). `ApplySchema` is idempotent (uses `IF NOT EXISTS`); production deployments typically run it via a migration tool (goose, atlas, sqlx-migrate) instead of at startup.
 
-`Wait` is polling-based in v0.2 (default 100 ms). `LISTEN/NOTIFY` for instant wakeup lands in v0.3 as opt-in.
+`Wait` is polling-based by default (100 ms). For reactive wake-up, enable LISTEN/NOTIFY by passing a dedicated `*pgx.Conn` via `Config.ListenConn`:
+
+```go
+listenConn, _ := pgx.Connect(ctx, dsn) // dedicated, not from the pool
+defer listenConn.Close(ctx)
+
+store := pg.New(pool, pg.Config{
+    TTL:          24 * time.Hour,
+    LockTimeout:  30 * time.Second,
+    PollInterval: 100 * time.Millisecond,
+    ListenConn:   listenConn,
+})
+defer store.Close()
+```
+
+The conn must be a dedicated `*pgx.Conn` outside `pgxpool` (LISTEN is connection-state). Polling stays as the correctness backstop — LISTEN is a latency hint, not a replacement.
+
+## Quickstart (Redis)
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	"time"
+
+	goredis "github.com/redis/go-redis/v9"
+
+	"github.com/polanski13/idemkit"
+	"github.com/polanski13/idemkit/store/redis"
+)
+
+func main() {
+	client := goredis.NewClient(&goredis.Options{Addr: "localhost:6379"})
+	defer client.Close()
+
+	store := redis.New(client, redis.Config{
+		TTL:          24 * time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: 100 * time.Millisecond,
+	})
+	mw := idemkit.Middleware(store, idemkit.Config{})
+
+	http.Handle("/v1/charges", mw(handler()))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+`redis.New` accepts `redis.UniversalClient` — `*Client`, `*ClusterClient`, `*Ring`, and `*FailoverClient` all work transparently. Every Lua script in the store touches exactly one key, so the store is Redis Cluster-compatible without hash tags.
+
+For reactive `Wait` (sub-poll-interval wake-up on `Save` / `Release`), enable the opt-in pub/sub overlay:
+
+```go
+store := redis.New(client, redis.Config{
+    TTL:          24 * time.Hour,
+    LockTimeout:  30 * time.Second,
+    PollInterval: 100 * time.Millisecond,
+    PubSub:       true,
+})
+defer store.Close()
+```
+
+Polling stays as the correctness backstop — Redis pub/sub has no persistence, so the overlay is purely a latency optimization, never the sole signal.
 
 ## Security and threat model
 
@@ -265,8 +327,8 @@ Zero values are replaced with defaults at `Middleware` construction time. To opt
 | Backend | Status | Package | Use case |
 |---------|--------|---------|----------|
 | In-memory | v0.1 | `github.com/polanski13/idemkit/store/mem` | Tests, single-instance deployments |
-| Postgres | ✅ v0.2 | `github.com/polanski13/idemkit/store/pg` | Production, cross-instance coordination |
-| Redis | planned v0.3 | `…/store/redis` | Production, high-throughput caching |
+| Postgres | ✅ v0.2 (LISTEN/NOTIFY ✅ v0.3) | `github.com/polanski13/idemkit/store/pg` | Production, cross-instance coordination |
+| Redis | ✅ v0.3 | `github.com/polanski13/idemkit/store/redis` | Production, lowest-latency cross-instance; Cluster-compatible |
 | Custom | always | implement `idemkit.Store` | Anything else |
 
 ## Conformance
@@ -295,7 +357,7 @@ A: Replay path adds ~1.4 μs marginal overhead vs no middleware; fresh path (cla
 A: `idemkit` detects `http.Flusher.Flush()` and silently skips caching. Pass-through to the client is unaffected. For endpoints you know upfront should bypass caching (file downloads, WebSocket upgrades), use `SkipFunc`.
 
 **Q: How is this different from `velmie/idempo`?**
-A: See [COMPARISON.md](COMPARISON.md). Short version: `idemkit` adds Postgres-first design (v0.2), pub/sub-coordinated wait (v0.3), selectable conflict semantics, streaming safe-skip in the v0.1 default, and an explicit threat-model section. `velmie/idempo` is Redis-only with polling wait, but is also smaller, simpler, and has shipped.
+A: See [COMPARISON.md](COMPARISON.md). Short version: `idemkit` adds Postgres + Redis with consistent semantics (v0.2 + v0.3), opt-in pub/sub-coordinated wait for both, selectable conflict semantics, streaming safe-skip in the v0.1 default, and an explicit threat-model section. `velmie/idempo` is Redis-only with polling wait, but is also smaller, simpler, and has shipped.
 
 ## Roadmap
 
@@ -303,7 +365,7 @@ A: See [COMPARISON.md](COMPARISON.md). Short version: `idemkit` adds Postgres-fi
 |---------|------|--------|
 | v0.1.0 | `net/http` middleware, in-mem store, fingerprinting, Stripe conflict, streaming safe-skip, threat model | ✅ released |
 | v0.2.0 | Postgres store, IETF conflict mode, chi example, conformance test suite, generation tokens, `Result.Clone()`, optional janitor for in-mem | ✅ released |
-| v0.3 | Redis store, opt-in LISTEN/NOTIFY (Postgres), opt-in Redis pub/sub | planned |
+| v0.3.0 | Redis store, opt-in LISTEN/NOTIFY (Postgres), opt-in Redis pub/sub overlay | ✅ released |
 | v1.0 | Stable API, semver guarantees | planned |
 
 Out of scope for v1.0: Prometheus / OpenTelemetry hooks (use the `Logger` field and your own observability stack), request-body streaming, custom codecs.

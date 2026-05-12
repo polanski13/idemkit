@@ -4,6 +4,37 @@ All notable changes to `idemkit` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Under 0.x the API is considered unstable; minor releases may include breaking changes that are called out below.
 
+## [0.3.0] — 2026-05-12
+
+### Added
+
+- **Redis backend** (`github.com/polanski13/idemkit/store/redis`) — implements `idemkit.Store` via `github.com/redis/go-redis/v9`. Lua-scripted `Begin` / `Save` / `Release` for single-RTT atomic operations; `crypto/rand` 64-bit tokens (no Redis counter, no sequence to maintain); Redis-native TTL handles lock-timeout reclaim (no `SELECT FOR UPDATE` analogue needed); polling `Wait`. Every Lua script touches exactly one key, so the store is Redis Cluster-compatible without hash tags. Constructor accepts `redis.UniversalClient` — works transparently with `*Client`, `*ClusterClient`, `*Ring`, and `*FailoverClient`.
+- **Opt-in Redis pub/sub overlay** (`redis.Config.PubSub`) — reactive `Wait` layered on top of polling. `Save` and `Release` `PUBLISH` inside the same Lua script that mutates state, on a notify channel derived from `Config.KeyPrefix` (default `"idemkit:notify"`); a subscriber goroutine dispatches each notification's payload (the bare key) to per-key registered waiters. The `Wait` `select` races notify-chan, polling-tick, and `ctx.Done()` via the nil-channel idiom — one select block covers both modes. Polling stays as the correctness backstop because Redis pub/sub has no persistence; the overlay is a latency hint, never the sole signal.
+- **Opt-in LISTEN/NOTIFY for Postgres** (`pg.Config.ListenConn`) — analogous to the Redis pub/sub overlay. Caller supplies a dedicated `*pgx.Conn` outside `pgxpool` (LISTEN is connection-state, pooled conns lose the subscription on return). Store issues `LISTEN idemkit_notify` and emits `pg_notify` from `Save` / `Release` via the same conditional pattern used in Redis (`CASE WHEN $N != '' THEN pg_notify(...)`), riding the same statement as the UPDATE / DELETE through a CTE. Polling stays as the correctness backstop. Store does **not** close the caller's conn on `Store.Close()` — caller owns conn lifecycle.
+- **`Store.Close()`** on both `pg.Store` and `redis.Store` — stops the listener / subscriber goroutine cleanly via `sync.Once`. No-op when the overlay is unset. Recommended pattern: `defer store.Close()` at process shutdown.
+- **CI Redis service** — `.github/workflows/ci.yml` now stands up `redis:7` alongside `postgres:16` and exposes `IDEMKIT_REDIS_TEST_URL` at job level. Tests skip cleanly when the env is unset (same convention as `IDEMKIT_PG_TEST_URL`).
+
+### Documented
+
+- DESIGN.md gains a "Redis store (v0.3)" section paralleling the Postgres one — storage layout, Lua-script rationale, `crypto/rand` token approach, why-no-`WATCH/MULTI/EXEC`, Cluster compatibility, and a "Pub/sub overlay" subsection covering the lifecycle contract.
+- DESIGN.md "Postgres store (v0.2)" section gains a "LISTEN/NOTIFY overlay" subsection covering the dedicated-conn requirement, the CTE rewrite of `saveSQL` / `releaseSQL` with conditional `pg_notify`, why-polling-stays, and the conn-ownership contract.
+- BENCHMARKS.md gains a "Redis store" section with measured 3-run median numbers; the "Postgres store" section is refreshed on the same methodology. Headline: Redis Begin is ~3.5× faster than pg Begin (Lua single-RTT vs pg multi-statement transaction), Save roundtrip ~2× faster.
+- README quickstarts for Redis (basic + pub/sub overlay) and an inline LISTEN/NOTIFY example in the Postgres quickstart.
+
+### Closed issues
+
+- #9 Implement Redis store (`store/redis`)
+- #10 Opt-in LISTEN/NOTIFY for Postgres store
+- #11 Opt-in Redis pub/sub overlay for `store/redis`
+
+### Dependencies
+
+- Added `github.com/redis/go-redis/v9` as a direct dependency. Only users importing `store/redis` link it; `idemkit` core, `store/mem`, and `store/pg` are unaffected.
+
+### Not breaking
+
+The `idemkit.Store` interface, the `idemkit.Config` shape, and the existing `pg.Config` / `mem.Config` fields are unchanged. v0.2 callers upgrade to v0.3 with no source edits unless they want to opt into the new overlays via the additive `pg.Config.ListenConn` and `redis.Config.PubSub` fields.
+
 ## [0.2.0] — 2026-05-12
 
 ### Added

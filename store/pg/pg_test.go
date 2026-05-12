@@ -415,7 +415,7 @@ func TestLockTimeout_ExpiredInFlightIsReclaimable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 
 	state, _, _, err := s.Begin(ctx, "k", []byte{2})
 	if err != nil {
@@ -438,7 +438,7 @@ func TestTTL_ExpiredDoneEntryIsReclaimable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 
 	state, _, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {

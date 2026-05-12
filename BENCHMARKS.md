@@ -161,13 +161,13 @@ export IDEMKIT_PG_TEST_URL="postgres://postgres:postgres@localhost:5432/idemkit_
 go test -run=^$ -bench=BenchmarkPG -benchmem -benchtime=2s ./store/pg/
 ```
 
-Headline numbers (single warm run, Apple M4, Postgres 16 running in colima Docker on the same host, unix-socket-equivalent localhost networking):
+Headline numbers (3-run median, Apple M4, Postgres 16 running in colima Docker on the same host, localhost-loopback networking):
 
 | Scenario | pg.Store ns/op | pg.Store B/op | pg.Store allocs/op | mem.Store ns/op (reference) | pg / mem |
 |---|--:|--:|--:|--:|--:|
-| `Begin` (Fresh) | ~548,000 | 589 | 15 | ~700 | ~780× |
-| `Begin` (Done, cache hit) | ~667,000 | 1,425 | 33 | ~90 | ~7,400× |
-| `Begin + Save` roundtrip | ~768,000 | 870 | 23 | ~820 | ~940× |
+| `Begin` (Fresh) | ~760,000 | 590 | 15 | ~700 | ~1,090× |
+| `Begin` (Done, cache hit) | ~841,000 | 1,425 | 33 | ~90 | ~9,300× |
+| `Begin + Save` roundtrip | ~895,000 | 983 | 26 | ~820 | ~1,090× |
 
 ### What this means in practice
 
@@ -180,14 +180,47 @@ For sub-millisecond cache hits you want `mem.Store`. For cross-instance coordina
 
 ### Cross-backend benchmark caveats
 
-- **Single run, warm system.** The pg numbers don't have the 3-run median treatment the other benchmarks do — pg latency is dominated by Postgres' own scheduling, which has its own variance.
 - **Docker on the same host is not production.** Real deployments have network latency between app and DB. Add 0.1–2 ms per round trip.
 - **`PollInterval` doesn't affect these benchmarks** (no `Wait` calls in the bench set); the `Wait` blocking path is exercised in tests, not benchmarks.
+- **Variance.** pg numbers drift 30–40% run-to-run on M4 — Postgres has its own scheduling latency on top of the M4 thermal envelope. The medians above smooth this but reproduction will land in a band, not on a point.
+
+## Redis store
+
+The `store/redis` backend implements `idemkit.Store` via Lua-scripted single-RTT atomic operations against Redis. Same cross-instance durability as `store/pg`, with materially lower per-operation latency because there is no transaction setup or multi-statement `Begin`.
+
+Benchmarks live alongside the integration tests at `store/redis/redis_test.go` (`BenchmarkRedis_*`). Reproduce:
+
+```bash
+export IDEMKIT_REDIS_TEST_URL="redis://localhost:6380/0"
+go test -run=^$ -bench=BenchmarkRedis -benchmem -benchtime=2s ./store/redis/
+```
+
+Headline numbers (3-run median, Apple M4, Redis 7 running in colima Docker on the same host, localhost-loopback networking):
+
+| Scenario | redis.Store ns/op | redis.Store B/op | redis.Store allocs/op | pg.Store ns/op (reference) | redis / pg |
+|---|--:|--:|--:|--:|--:|
+| `Begin` (Fresh) | ~214,000 | 544 | 20 | ~760,000 | **0.28×** |
+| `Begin` (Done, cache hit) | ~226,000 | 816 | 31 | ~841,000 | **0.27×** |
+| `Begin + Save` roundtrip | ~438,000 | 1,248 | 41 | ~895,000 | **0.49×** |
+
+### What this means in practice
+
+- **Redis `Begin` runs 3.5–3.7× faster than pg.** Single Lua script per call — atomic claim or replay in one server-side execution — beats pg's `BEGIN → INSERT [ON CONFLICT] → maybe SELECT FOR UPDATE → COMMIT` sequence for the same logical operation.
+- **The Save roundtrip gap narrows to ~2×.** Save itself is a single statement on both backends; the Begin-side advantage is averaged into the longer measurement window.
+- **Cache hits cost essentially the same as fresh claims** (214 vs 226 μs). Both paths are a single Lua script invocation; the only extra cost on the Done path is HMGET-decoding the cached response fields. Compare to pg where cache hits incur JSONB header deserialization (760 → 841 μs, +11%).
+- **Pub/sub overlay does not affect benchmark numbers.** The overlay only short-circuits the polling tick in `Wait`, and `Wait` is not in the bench set — the blocking-path contract is exercised in `TestPubSub_*` tests instead.
+- **Allocations are slightly higher than pg** (20 vs 15 fresh, 31 vs 33 done, 41 vs 26 roundtrip). The Lua script argument vector (channel, key, body hash, token, hash-field values) is wider than the equivalent pgx parameter slice. Not the bottleneck.
+
+For sub-100-μs cache hits you want `mem.Store`. For cross-instance coordination with the lowest possible per-request latency, pick `store/redis` over `store/pg` — at the cost of Redis's at-most-once persistence guarantee (depends on RDB / AOF settings; not as durable as Postgres WAL by default).
+
+### Cross-backend benchmark caveats (redis-specific)
+
+- **Same variance caveat as pg** — colima Docker on M4 has thermal-driven variance; medians above are honest representatives but expect reproduction to land in a 20–30% band.
+- **Cluster-mode latency is not measured.** Single-instance Redis on the same host is the floor. Cluster routing adds ~1 hop minimum across nodes; production sharded Redis deployments add real network latency on top.
 
 ## Not benchmarked yet (deferred to later releases)
 
 - `mem.Store` under high lock contention (1000+ concurrent goroutines on one key) — the parallel bench tops out at GOMAXPROCS. A true contention benchmark would use synchronised goroutine fan-out.
-- `pg.Store` round-trip benchmarks on real hardware — placeholder above. Will land once a benchmark run completes.
-- Redis store — doesn't exist yet (v0.3).
-- The `Wait` blocking path under concurrent waiters — Go's testing framework doesn't directly support benchmarking blocking calls cleanly. Documented in tests (`TestConcurrentWaiters_AllReceiveSavedResult`) instead.
-- `LISTEN/NOTIFY`-driven `Wait` for pg (v0.3 opt-in).
+- The `Wait` blocking path under concurrent waiters — Go's testing framework doesn't directly support benchmarking blocking calls cleanly. Documented in tests (`TestConcurrentWaiters_AllReceiveSavedResult`, `TestPubSub_ConcurrentWaitersAllWake`, `TestListen_ConcurrentWaitersAllWake`) instead.
+- LISTEN/NOTIFY-driven `Wait` for pg and Redis pub/sub-driven `Wait` for redis — both opt-in overlays. The `Wait` path itself isn't in the bench set; latency improvements are observable via test wake-time measurements (sub-200 ms with 5 s `PollInterval` configured, demonstrating overlay-driven wake-up).
+- Real-server (not localhost-Docker) numbers for pg and Redis on production hardware — placeholder for whoever reproduces against their own infrastructure.
