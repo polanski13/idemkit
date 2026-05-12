@@ -95,9 +95,49 @@ The **relative ratios** between benchmarks (e.g., "Replay is ~1.6× Baseline", "
 3. **Map growth.** `BenchmarkBegin_Fresh` and `BenchmarkMiddleware_FreshPerKey` accumulate entries in the store (no TTL eviction during a benchmark). Go's map grows in amortised O(1); very long benchmark runs may show slight ns/op drift as the map resizes. Not material at the iteration counts above.
 4. **Allocations include `httptest` machinery.** ~17 of the ~21 allocs/op in the baseline are from `httptest.NewRequest` constructing a `*http.Request` with all its sub-structures (URL, Header map, Body reader, etc.). The remaining ~4 are from the handler. idemkit's own marginal allocs (+9 for replay, +21 for fresh) are layered on top.
 
+## Comparison vs `velmie/idempo`
+
+`velmie/idempo` is the closest comparable Go library — same `net/http` integration model, similar body-hash + wait-for-in-progress semantics, also offers an in-memory store. The `benchmarks/` directory contains an apples-to-apples comparison: identical handler, identical request payload, both libraries with their respective in-memory backends and equivalent configuration (idemkit defaults + velmie with `WithWaitForInProgress(true)` + `WithAllowedResponseHeaders("Content-Type")`).
+
+Reproduce locally:
+
+```bash
+cd benchmarks
+go test -run=^$ -bench=. -benchmem -benchtime=2s .
+```
+
+Median of 3 warm runs on the same hardware:
+
+| Scenario | idemkit ns/op | velmie ns/op | idemkit allocs/op | velmie allocs/op |
+|---|--:|--:|--:|--:|
+| Replay (cache hit) | ~1670 | ~1890 | **30** | **35** |
+| Fresh (claim + handler + Save) | ~4120 | ~7590 | **42** | **63** |
+| Pass-through (no `Idempotency-Key`) | ~2470 | ~2230 | 21 | 21 |
+| Replay `RunParallel` × 10 cores | ~2320 | ~2800 | 30 | 35 |
+
+| Scenario | Relative timing | Relative allocations |
+|---|---|---|
+| Replay | idemkit ~12% faster | idemkit -5 allocs (~14% fewer) |
+| Fresh | idemkit **~46% faster** | idemkit **-21 allocs (~33% fewer)** |
+| Pass-through | velmie ~10% faster | tied |
+| Replay parallel | idemkit ~17% faster | idemkit -5 allocs |
+
+### What this means
+
+- **Both libraries are fast enough for production.** The differences are sub-microsecond per request on warm M4. On a 10K rps service, idemkit's advantage in the fresh path saves ~35 ms/sec of CPU — about 3.5% of a core. Real, but not transformative.
+- **idemkit's edge is biggest in the fresh path.** This is where length-prefixed fingerprinting + channel-broadcast wait + the unexported `responseWriter` design pay off compared to velmie's polling-based wait and concat fingerprint.
+- **Pass-through is essentially tied.** Both libraries short-circuit on the no-key path with minimal overhead. The ~240 ns gap is within run-to-run noise (see Methodology).
+- **Allocations are stable across runs.** While ns/op fluctuates 1.5–2× with M4 thermal state, the alloc counts (30 vs 35 replay, 42 vs 63 fresh) don't drift. They are the most reliable metric.
+
+### Caveats specific to this comparison
+
+- **Default configurations are not perfectly equivalent.** velmie defaults to no body-hash fingerprinting; the comparison uses `WithWaitForInProgress(true)` to match idemkit's always-on wait. Other knobs (max body bytes, allowed headers) are configured to match idemkit's defaults as closely as possible.
+- **velmie's polling wait** is opt-in (the default is fail-fast on duplicate); with polling enabled, the replay path goes through their poll loop even on warm cache hits. idemkit's channel-based wait short-circuits earlier.
+- **No Redis comparison.** velmie's strong point is Redis support, which idemkit will only ship in v0.3. A Redis-vs-Redis comparison will be a v0.3 benchmark.
+- **Single-instance only.** Cross-instance coordination changes everything. These numbers are for the in-mem case.
+
 ## Not benchmarked yet (deferred to v0.2+)
 
-- Comparison against `velmie/idempo` — requires apples-to-apples setup with their in-mem backend and identical request shapes. Documented as a v0.1 goal in the plan; deferred to v0.2 because the internal numbers above already characterise idemkit's cost adequately for adoption decisions.
 - `mem.Store` under high lock contention (1000+ concurrent goroutines on one key) — the parallel bench tops out at GOMAXPROCS. A true contention benchmark would use synchronised goroutine fan-out.
 - Postgres / Redis stores — they don't exist yet.
 - The `Wait` blocking path under concurrent waiters — Go's testing framework doesn't directly support benchmarking blocking calls cleanly. Documented in tests (`TestConcurrentWaiters_AllReceiveSavedResult`) instead.

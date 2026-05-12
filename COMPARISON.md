@@ -35,6 +35,21 @@ A side-by-side of `idemkit` and the other Go libraries / sample projects that tr
 
 **`go-rocket-ride` is a sample app** for Brandur's 2017 blog post, not a library. Reference it for the architecture, don't depend on it.
 
+## Measured performance vs `velmie/idempo`
+
+An apples-to-apples in-memory benchmark lives in [`benchmarks/`](benchmarks/) (separate Go module so the main project keeps zero non-stdlib runtime dependencies). Headline numbers (median of 3 warm runs, Apple M4):
+
+| Scenario | idemkit | velmie | Δ timing | Δ allocations |
+|---|--:|--:|---|---|
+| Replay (cache hit) | ~1670 ns/op | ~1890 ns/op | idemkit ~12% faster | -5 allocs (~14% fewer) |
+| Fresh (claim + Save) | ~4120 ns/op | ~7590 ns/op | idemkit ~46% faster | -21 allocs (~33% fewer) |
+| Pass-through | ~2470 ns/op | ~2230 ns/op | tied (within noise) | tied |
+| Replay parallel | ~2320 ns/op | ~2800 ns/op | idemkit ~17% faster | -5 allocs |
+
+Full methodology, caveats (including velmie's polling-wait vs idemkit's channel-broadcast), and how to reproduce: see [BENCHMARKS.md](BENCHMARKS.md#comparison-vs-velmieidempo).
+
+Both libraries are fast enough for production. idemkit's measurable advantage in the fresh path comes from channel-based wait + length-prefixed fingerprinting + the unexported response writer. velmie's strong point — Redis backend, shipped — is not yet a competition idemkit enters until v0.3.
+
 ## How this list is maintained
 
 This document is updated when a v0.x release ships. If you spot a missing library or an outdated row, file an issue or open a PR. The intent is honest comparison, not marketing — corrections about competing libraries are welcome.
