@@ -21,6 +21,22 @@ jobs:
       fail-fast: false
       matrix:
         go: ['1.25', 'stable']
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: idemkit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IDEMKIT_PG_TEST_URL: postgres://postgres:postgres@localhost:5432/idemkit_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,7 +63,7 @@ jobs:
         run: go build ./...
 
       - name: Test (race)
-        run: go test -count=1 -race -timeout=2m ./...
+        run: go test -count=1 -race -timeout=3m ./...
 
   fuzz:
     name: Fuzz smoke (15s)

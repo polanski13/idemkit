@@ -5,12 +5,14 @@ This document records why the code is shaped the way it is, deviations from the 
 ## Public surface
 
 ```
-github.com/polanski13/idemkit              # Middleware, Config, Fingerprint, Store, Result, State,
-                                           # ConflictMode, ConflictReason, ErrBodyMismatch, DefaultHasher
+github.com/polanski13/idemkit              # Middleware, Config, Fingerprint, Store, Result, State, Token,
+                                           # ConflictMode, ConflictReason, ErrBodyMismatch, ErrTokenMismatch,
+                                           # DefaultHasher
 github.com/polanski13/idemkit/store/mem    # mem.Store, mem.Config, mem.New
+github.com/polanski13/idemkit/store/pg     # pg.Store, pg.Config, pg.New, pg.ApplySchema (v0.2)
 ```
 
-Subpackages are added when there is something to put in them. `store/pg` and `store/redis` land in v0.2 / v0.3. No `adapter/chi`, `adapter/gin`, `adapter/echo` packages — for chi/gin the middleware composes as `r.Use(idemkit.Middleware(...))` with no glue needed. Echo and Fiber have different handler shapes and could warrant small adapter packages post-v1.0 if there's demand.
+Subpackages are added when there is something to put in them. `store/redis` lands in v0.3. No `adapter/chi`, `adapter/gin`, `adapter/echo` packages — for chi/gin the middleware composes as `r.Use(idemkit.Middleware(...))` with no glue needed. Echo and Fiber have different handler shapes and could warrant small adapter packages post-v1.0 if there's demand.
 
 ## Fingerprint: length-prefixed framing
 
@@ -44,6 +46,83 @@ type entry struct {
 **Why a fresh channel per entry?** Entries are single-shot: after `Save` or `Release`, the entry is either replaced or removed. The closed channel is never reused. New entry → new channel.
 
 **Lazy expiration via `lookupLocked(key, now)`.** TTL and `LockTimeout` are enforced on read: when `Begin` or `Wait` accesses a key, expired entries are purged in the same map lookup. No background janitor goroutine in v0.1 — keeps the store dependency-free and trivially predictable in tests. A janitor lands in v0.2+ if needed for bounded memory under adversarial load.
+
+## Postgres store (v0.2)
+
+`store/pg` implements `idemkit.Store` on top of `pgx/v5`. Same behavioural contract as `mem.Store`, with serialised state durably persisted across processes.
+
+### Schema
+
+```sql
+CREATE SEQUENCE idemkit_token_seq AS BIGINT INCREMENT BY 1 START WITH 1 NO CYCLE;
+
+CREATE TABLE idemkit_keys (
+    key              TEXT        PRIMARY KEY,
+    body_hash        BYTEA       NOT NULL,
+    state            SMALLINT    NOT NULL,
+    response_code    INT,
+    response_headers JSONB,
+    response_body    BYTEA,
+    locked_at        TIMESTAMPTZ NOT NULL,
+    completed_at     TIMESTAMPTZ,
+    expires_at       TIMESTAMPTZ NOT NULL,
+    token            BIGINT      NOT NULL
+);
+
+CREATE INDEX idemkit_keys_expires_at ON idemkit_keys (expires_at);
+```
+
+`response_headers` is JSONB; `http.Header` (`map[string][]string`) round-trips through `encoding/json` cleanly, preserving the nil-vs-empty distinction (`null` JSON for nil, `{}` for empty). `response_body` is `BYTEA`.
+
+### Begin
+
+Wrapped in a transaction for atomicity between insert-attempt and follow-up SELECT/UPDATE:
+
+1. `INSERT ... ON CONFLICT DO NOTHING RETURNING token` with `nextval('idemkit_token_seq')`. If a row is returned → `Fresh`, commit, return token.
+2. Otherwise the key already exists. `SELECT ... FOR UPDATE` locks the row for the rest of the transaction.
+3. If `expires_at < NOW()` (lock-timeout or TTL elapsed), `UPDATE` the row in place — new state, new bodyHash, new locked_at, new expires_at, new token from the sequence, response_* cleared. Commit. Return `Fresh` with new token.
+4. Otherwise return `InFlight` / `Done` per state, with `ErrBodyMismatch` if hashes differ. Commit (releases the FOR UPDATE lock).
+
+3 round trips in the worst case (Begin → Insert miss → Select → maybe Update). Can be collapsed into a single CTE later if benchmarks show the latency matters.
+
+### Wait
+
+Polling-based in v0.2 (default 100 ms). On each tick, query the row's state filtered by `expires_at > NOW()`:
+
+- `pgx.ErrNoRows` → entry absent or expired → return `(nil, nil)` (caller retries `Begin`)
+- state=done → return cached result
+- state=in_flight → tick again
+
+Tight loop on `ctx.Done()` exits cleanly with `ctx.Err()`.
+
+`LISTEN/NOTIFY` is documented in v0.3 as opt-in. It requires a dedicated `pgx.Conn` outside `pgxpool` (`LISTEN` is connection-state) — operational cost most callers don't want by default. Polling at 100 ms is good enough for the latencies idempotency targets.
+
+### Save
+
+```sql
+UPDATE idemkit_keys
+SET state = $1, response_code = $2, response_headers = $3, response_body = $4,
+    completed_at = NOW(), expires_at = NOW() + ($5 * INTERVAL '1 second')
+WHERE key = $6 AND token = $7
+```
+
+If `RowsAffected() == 0` → `ErrTokenMismatch`. Same semantics as `mem.Store`: another caller reclaimed the key, our token is stale.
+
+### Release
+
+```sql
+DELETE FROM idemkit_keys WHERE key = $1 AND token = $2
+```
+
+`RowsAffected()` is not checked — Release is idempotent. Absent or mismatched-token both succeed silently.
+
+### Token generation
+
+A single Postgres `SEQUENCE` (`idemkit_token_seq`) hands out globally unique BIGINT tokens. Sequences in Postgres are MVCC-aware and lock-free; no contention even at high claim rates. Wrap-around at 2^63: 100K claims/sec for 2.9 million years. Effectively infinite.
+
+### Why no advisory locks
+
+The plan considered `pg_try_advisory_xact_lock` as a secondary fence. `hashtext(key)` collides under high cardinality (int4 keyspace, 32-bit hash). The two-int4 form (`pg_try_advisory_xact_lock(int4, int4)`) fed with the first and last 32 bits of SHA-256(key) gives 64-bit collision resistance — but the row-based claim with `FOR UPDATE` already serialises operations correctly. Advisory locks add overhead for no correctness gain. Documented; not implemented.
 
 ## Response capture: pass-through + drop on streaming
 

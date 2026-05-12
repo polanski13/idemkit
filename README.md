@@ -29,7 +29,7 @@ Out of scope for v0.1, see [Roadmap](#roadmap): Postgres store, Redis store, IET
 go get github.com/polanski13/idemkit
 ```
 
-Requires Go 1.25 or later. Zero non-stdlib runtime dependencies.
+Requires Go 1.25 or later. The core `idemkit` package and `store/mem` have zero non-stdlib runtime dependencies. Backend subpackages (`store/pg`) bring their own driver as a direct dep (`github.com/jackc/pgx/v5`); users who only need in-memory storage don't link it.
 
 ## Quickstart
 
@@ -77,6 +77,51 @@ curl -X POST -i -H "Idempotency-Key: ch_001" http://localhost:8080/v1/charges
 ```
 
 Full runnable example: [examples/nethttp/main.go](examples/nethttp/main.go).
+
+## Quickstart (Postgres)
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/polanski13/idemkit"
+	"github.com/polanski13/idemkit/store/pg"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://user:pass@localhost:5432/app?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := pg.ApplySchema(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	store := pg.New(pool, pg.Config{
+		TTL:          24 * time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: 100 * time.Millisecond,
+	})
+	mw := idemkit.Middleware(store, idemkit.Config{})
+
+	http.Handle("/v1/charges", mw(handler()))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+The schema is in [store/pg/schema.sql](store/pg/schema.sql). `ApplySchema` is idempotent (uses `IF NOT EXISTS`); production deployments typically run it via a migration tool (goose, atlas, sqlx-migrate) instead of at startup.
+
+`Wait` is polling-based in v0.2 (default 100 ms). `LISTEN/NOTIFY` for instant wakeup lands in v0.3 as opt-in.
 
 ## Security and threat model
 
@@ -174,8 +219,8 @@ Zero values are replaced with defaults at `Middleware` construction time. To opt
 | Backend | Status | Package | Use case |
 |---------|--------|---------|----------|
 | In-memory | v0.1 | `github.com/polanski13/idemkit/store/mem` | Tests, single-instance deployments |
-| Postgres | v0.2 | `…/store/pg` | Production, cross-instance coordination |
-| Redis | v0.3 | `…/store/redis` | Production, high-throughput caching |
+| Postgres | ✅ v0.2 | `github.com/polanski13/idemkit/store/pg` | Production, cross-instance coordination |
+| Redis | planned v0.3 | `…/store/redis` | Production, high-throughput caching |
 | Custom | always | implement `idemkit.Store` | Anything else |
 
 ## Conformance

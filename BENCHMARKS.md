@@ -150,8 +150,25 @@ The [COMPARISON.md](COMPARISON.md) table lists eight prior-art libraries. Only `
 
 `velmie/idempo` is the only library in the landscape that ships the same feature set: `net/http`-native, body-hash fingerprinting, opt-in wait-for-in-progress, framework-agnostic. The comparison numbers above are meaningful precisely because both libraries are doing the same work.
 
-## Not benchmarked yet (deferred to v0.2+)
+## Postgres store
+
+The `store/pg` backend trades raw latency for cross-instance durability. Per-request cost includes one round trip to Postgres per `Store` method (Begin: 1–3 round trips, Save: 1, Release: 1, Wait: 1 per poll tick).
+
+A pg-vs-mem benchmark suite lives in `benchmarks/` alongside the velmie comparison. Headline numbers (medians, M4 with Postgres 16 running in Docker on the same host, default 100 ms `PollInterval`):
+
+| Scenario | mem.Store | pg.Store | Δ |
+|---|--:|--:|---|
+| Replay (cache hit) | ~90 ns | TBD | TBD |
+| Begin + Save roundtrip | ~820 ns | TBD | TBD |
+
+Numbers will be filled in once a local benchmark run completes. Expected ranges: pg replay ~100-500 μs (single round trip + serialization); pg fresh ~200-1000 μs (2-3 round trips). Across a network link, multiply by RTT.
+
+`pg.Store` overhead is dominated by Postgres' query latency, not by idemkit code. Tuning the Postgres connection pool (`pgxpool.Config.MaxConns`), running on the same VPC as the application, and using prepared statements (pgx does this automatically per connection) are the levers for production tuning.
+
+## Not benchmarked yet (deferred to later releases)
 
 - `mem.Store` under high lock contention (1000+ concurrent goroutines on one key) — the parallel bench tops out at GOMAXPROCS. A true contention benchmark would use synchronised goroutine fan-out.
-- Postgres / Redis stores — they don't exist yet.
+- `pg.Store` round-trip benchmarks on real hardware — placeholder above. Will land once a benchmark run completes.
+- Redis store — doesn't exist yet (v0.3).
 - The `Wait` blocking path under concurrent waiters — Go's testing framework doesn't directly support benchmarking blocking calls cleanly. Documented in tests (`TestConcurrentWaiters_AllReceiveSavedResult`) instead.
+- `LISTEN/NOTIFY`-driven `Wait` for pg (v0.3 opt-in).
