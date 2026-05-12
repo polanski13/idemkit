@@ -66,7 +66,7 @@ func handle(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, ne
 	hash := cfg.Hasher(fp.Canonical())
 
 	for attempt := 0; attempt < maxBeginAttempts; attempt++ {
-		state, cached, err := store.Begin(r.Context(), storageKey, hash)
+		state, cached, token, err := store.Begin(r.Context(), storageKey, hash)
 		if err != nil {
 			if errors.Is(err, ErrBodyMismatch) {
 				handleConflict(w, r, cfg, ReasonBodyMismatch)
@@ -78,7 +78,7 @@ func handle(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, ne
 		}
 		switch state {
 		case StateFresh:
-			runFresh(w, r, store, cfg, storageKey, next)
+			runFresh(w, r, store, cfg, storageKey, token, next)
 			return
 		case StateInFlight:
 			waited, err := store.Wait(r.Context(), storageKey)
@@ -102,19 +102,19 @@ func handle(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, ne
 	next.ServeHTTP(w, r)
 }
 
-func runFresh(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, storageKey string, next http.Handler) {
+func runFresh(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, storageKey string, token Token, next http.Handler) {
 	cw := newResponseWriter(w, cfg.MaxResponseBytes)
 	completed := false
 	defer func() {
 		if !completed {
-			_ = store.Release(context.Background(), storageKey)
+			_ = store.Release(context.Background(), storageKey, token)
 		}
 	}()
 	next.ServeHTTP(cw, r)
 	completed = true
 
 	if !cw.cacheable() {
-		if err := store.Release(r.Context(), storageKey); err != nil {
+		if err := store.Release(r.Context(), storageKey, token); err != nil {
 			cfg.Logger.Warn("idemkit: store Release", "err", err, "key", storageKey)
 		}
 		return
@@ -122,15 +122,15 @@ func runFresh(w http.ResponseWriter, r *http.Request, store Store, cfg *Config, 
 
 	result := cw.snapshot()
 	if result.StatusCode >= 500 && !cfg.CacheServerErrors {
-		if err := store.Release(r.Context(), storageKey); err != nil {
+		if err := store.Release(r.Context(), storageKey, token); err != nil {
 			cfg.Logger.Warn("idemkit: store Release", "err", err, "key", storageKey)
 		}
 		return
 	}
 
-	if err := store.Save(r.Context(), storageKey, result); err != nil {
+	if err := store.Save(r.Context(), storageKey, token, result); err != nil {
 		cfg.Logger.Warn("idemkit: store Save", "err", err, "key", storageKey)
-		_ = store.Release(r.Context(), storageKey)
+		_ = store.Release(r.Context(), storageKey, token)
 	}
 }
 

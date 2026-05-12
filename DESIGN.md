@@ -172,28 +172,31 @@ The plan's approach offers defense-in-depth against bodyHash collisions across s
 
 The plan promised `internal/conformance/stripe_test.go` and `internal/conformance/ietf_draft07_test.go`. The Stripe semantics are exercised by `middleware_test.go` instead; the IETF conformance suite lands in v0.2 alongside `ConflictIETF` implementation.
 
-## Known limitations (v0.1)
+## Known limitations
 
-These are documented because they will eventually need fixing, but are not v0.1 blockers.
+These are documented because they will eventually need fixing. v0.2 closed two of them (#1, #2); the rest carry into later releases.
 
-### 1. Lock-timeout + reclaim race in `Save`
+### 1. ~~Lock-timeout + reclaim race in `Save`~~ — closed in v0.2
 
-Sequence:
-1. Caller A claims key with body hash `H_A`.
-2. A's lock times out without `Save`.
-3. Caller B reclaims the key with a new claim, body hash `H_B`.
-4. A's handler finally completes and calls `Save` with result `R_A`.
-5. The map entry now has body hash `H_B` (from B's claim) and result `R_A` (from A's `Save`). Subsequent `Begin` callers see `Done` + body mismatch even if their hash matches B's intent.
+**Resolved by generation tokens** (issue #3, v0.2). Each `Begin` returns a `Token`; `Save` and `Release` require it and refuse to mutate if the entry's current generation doesn't match. The race scenario is now caught and verified by `TestSave_AfterReclaimByOtherCallerReturnsErrTokenMismatch`.
 
-Realistically the precondition is rare (handler exceeded `LockTimeout` while another caller racing on the same key). The fix is **generation tokens** — every claim returns a token; `Save` requires the token and refuses to overwrite if it changed. Lands in v0.2 alongside the Postgres backend, where this race is more likely in practice.
+Interface change:
 
-### 2. `Result` is not defensively cloned
+```go
+type Store interface {
+    Begin(ctx context.Context, key string, bodyHash []byte) (State, *Result, Token, error)
+    Save(ctx context.Context, key string, token Token, result *Result) error
+    Release(ctx context.Context, key string, token Token) error
+}
+```
 
-The `*Result` returned from `Begin` / `Wait` is the same pointer the store holds internally. A caller that mutates `Result.Body` or `Result.Header` after replay corrupts the cache.
+`Token` is `uint64` — zero is "no claim". `Save` with a missing/wrong token returns `ErrTokenMismatch`. `Release` with a missing/wrong token is a noop (idempotent by design).
 
-The middleware itself does not mutate (it calls `slices.Clone` on each header value when writing back). Custom `OnConflict` callbacks or direct `Store` users could.
+### 2. ~~`Result` is not defensively cloned~~ — closed in v0.2
 
-Fix: add a `(*Result).Clone()` method and have the store call it on storage and retrieval. Lands in v0.2.
+**Resolved by `Result.Clone()`** (issue #4, v0.2). `mem.Store` now clones on both input (`Save`) and output (`Begin` / `Wait` of cached results). Caller mutation of returned `Result` or post-`Save` mutation of the input cannot corrupt the cache. Verified by `TestSave_InputClonedSoCallerMutationDoesNotCorruptCache` and `TestBegin_OutputClonedSoCallerMutationDoesNotCorruptCache`.
+
+Cost: two header-clone + body-copy operations per cache miss-and-fill cycle. Re-benchmark in v0.2; expected to be within the existing per-request budget.
 
 ### 3. Waiter without `ctx.Deadline` can theoretically block forever
 

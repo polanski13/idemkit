@@ -8,6 +8,7 @@ import (
 type stubStore struct {
 	beginState  State
 	beginResult *Result
+	beginToken  Token
 	beginErr    error
 	waitResult  *Result
 	waitErr     error
@@ -15,19 +16,19 @@ type stubStore struct {
 	releaseErr  error
 }
 
-func (s stubStore) Begin(context.Context, string, []byte) (State, *Result, error) {
-	return s.beginState, s.beginResult, s.beginErr
+func (s stubStore) Begin(context.Context, string, []byte) (State, *Result, Token, error) {
+	return s.beginState, s.beginResult, s.beginToken, s.beginErr
 }
 
 func (s stubStore) Wait(context.Context, string) (*Result, error) {
 	return s.waitResult, s.waitErr
 }
 
-func (s stubStore) Save(context.Context, string, *Result) error {
+func (s stubStore) Save(context.Context, string, Token, *Result) error {
 	return s.saveErr
 }
 
-func (s stubStore) Release(context.Context, string) error {
+func (s stubStore) Release(context.Context, string, Token) error {
 	return s.releaseErr
 }
 
@@ -43,7 +44,7 @@ func TestStore_StubExercisesAllMethods(t *testing.T) {
 	}
 	var iface Store = s
 
-	state, res, err := iface.Begin(ctx, "k", []byte{1, 2, 3})
+	state, res, _, err := iface.Begin(ctx, "k", []byte{1, 2, 3})
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -62,11 +63,11 @@ func TestStore_StubExercisesAllMethods(t *testing.T) {
 		t.Fatalf("Wait result: got %v want cached", got)
 	}
 
-	if err := iface.Save(ctx, "k", cached); err != nil {
+	if err := iface.Save(ctx, "k", Token(1), cached); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	if err := iface.Release(ctx, "k"); err != nil {
+	if err := iface.Release(ctx, "k", Token(1)); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 }

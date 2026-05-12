@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -51,7 +52,7 @@ func newStoreWithClock(c *fakeClock) *mem.Store {
 
 func TestBegin_FreshOnFirstCall(t *testing.T) {
 	s := newStore()
-	state, res, err := s.Begin(context.Background(), "k", []byte{1})
+	state, res, tok, err := s.Begin(context.Background(), "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -61,15 +62,18 @@ func TestBegin_FreshOnFirstCall(t *testing.T) {
 	if res != nil {
 		t.Fatalf("result: %v, want nil", res)
 	}
+	if tok == 0 {
+		t.Fatal("token: 0, want non-zero on Fresh")
+	}
 }
 
 func TestBegin_InFlightOnSecondCallSameKey(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	if _, _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
 		t.Fatal(err)
 	}
-	state, res, err := s.Begin(ctx, "k", []byte{1})
+	state, res, tok, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -79,15 +83,18 @@ func TestBegin_InFlightOnSecondCallSameKey(t *testing.T) {
 	if res != nil {
 		t.Fatalf("result: %v, want nil", res)
 	}
+	if tok != 0 {
+		t.Fatalf("token: %d, want 0 on non-Fresh", tok)
+	}
 }
 
 func TestBegin_BodyMismatchWhileInFlight(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	if _, _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
 		t.Fatal(err)
 	}
-	state, _, err := s.Begin(ctx, "k", []byte{2})
+	state, _, _, err := s.Begin(ctx, "k", []byte{2})
 	if !errors.Is(err, idemkit.ErrBodyMismatch) {
 		t.Fatalf("err: %v, want ErrBodyMismatch", err)
 	}
@@ -96,10 +103,27 @@ func TestBegin_BodyMismatchWhileInFlight(t *testing.T) {
 	}
 }
 
+func TestBegin_FreshClaimsGetUniqueTokens(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+
+	_, _, tokA, _ := s.Begin(ctx, "a", []byte{1})
+	_, _, tokB, _ := s.Begin(ctx, "b", []byte{2})
+	_, _, tokC, _ := s.Begin(ctx, "c", []byte{3})
+
+	if tokA == 0 || tokB == 0 || tokC == 0 {
+		t.Fatalf("zero tokens: a=%d b=%d c=%d", tokA, tokB, tokC)
+	}
+	if tokA == tokB || tokB == tokC || tokA == tokC {
+		t.Fatalf("non-unique tokens: a=%d b=%d c=%d", tokA, tokB, tokC)
+	}
+}
+
 func TestBegin_DoneWithCachedResultOnMatchingHash(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 	saved := &idemkit.Result{
@@ -107,59 +131,64 @@ func TestBegin_DoneWithCachedResultOnMatchingHash(t *testing.T) {
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       []byte(`{"id":42}`),
 	}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
-	state, got, err := s.Begin(ctx, "k", []byte{1})
+	state, got, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if state != idemkit.StateDone {
 		t.Fatalf("state: %v, want StateDone", state)
 	}
-	if got != saved {
-		t.Fatalf("result: %v, want saved", got)
+	if !reflect.DeepEqual(got, saved) {
+		t.Fatalf("result: %#v, want %#v", got, saved)
+	}
+	if got == saved {
+		t.Fatal("result returned by reference; expected a clone")
 	}
 }
 
 func TestBegin_BodyMismatchOnDone_StillReturnsCachedResult(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 	saved := &idemkit.Result{StatusCode: 200}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
-	state, got, err := s.Begin(ctx, "k", []byte{2})
+	state, got, _, err := s.Begin(ctx, "k", []byte{2})
 	if !errors.Is(err, idemkit.ErrBodyMismatch) {
 		t.Fatalf("err: %v, want ErrBodyMismatch", err)
 	}
 	if state != idemkit.StateDone {
 		t.Fatalf("state: %v, want StateDone", state)
 	}
-	if got != saved {
-		t.Fatalf("result not returned alongside mismatch error: %v", got)
+	if !reflect.DeepEqual(got, saved) {
+		t.Fatalf("result not returned alongside mismatch error: got %#v want %#v", got, saved)
 	}
 }
 
 func TestWait_ReturnsImmediatelyWhenDone(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 	saved := &idemkit.Result{StatusCode: 200}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Wait(ctx, "k")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if got != saved {
-		t.Fatalf("result: %v, want saved", got)
+	if !reflect.DeepEqual(got, saved) {
+		t.Fatalf("result: %#v, want %#v", got, saved)
 	}
 }
 
@@ -177,7 +206,8 @@ func TestWait_ReturnsNilWhenAbsent(t *testing.T) {
 func TestWait_BlocksUntilSave(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,7 +228,7 @@ func TestWait_BlocksUntilSave(t *testing.T) {
 	}
 
 	saved := &idemkit.Result{StatusCode: 200}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
 
@@ -207,8 +237,8 @@ func TestWait_BlocksUntilSave(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("err: %v", got.err)
 		}
-		if got.res != saved {
-			t.Fatalf("result: %v, want saved", got.res)
+		if !reflect.DeepEqual(got.res, saved) {
+			t.Fatalf("result: %#v, want %#v", got.res, saved)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Wait did not return after Save")
@@ -218,7 +248,8 @@ func TestWait_BlocksUntilSave(t *testing.T) {
 func TestWait_BlocksUntilReleaseReturnsNil(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,7 +269,7 @@ func TestWait_BlocksUntilReleaseReturnsNil(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if err := s.Release(ctx, "k"); err != nil {
+	if err := s.Release(ctx, "k", tok); err != nil {
 		t.Fatal(err)
 	}
 
@@ -257,7 +288,7 @@ func TestWait_BlocksUntilReleaseReturnsNil(t *testing.T) {
 
 func TestWait_HonorsCtxCancellation(t *testing.T) {
 	s := newStore()
-	if _, _, err := s.Begin(context.Background(), "k", []byte{1}); err != nil {
+	if _, _, _, err := s.Begin(context.Background(), "k", []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -273,13 +304,14 @@ func TestWait_HonorsCtxCancellation(t *testing.T) {
 func TestRelease_AllowsReclaim(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Release(ctx, "k"); err != nil {
+	if err := s.Release(ctx, "k", tok); err != nil {
 		t.Fatal(err)
 	}
-	state, _, err := s.Begin(ctx, "k", []byte{1})
+	state, _, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,19 +322,143 @@ func TestRelease_AllowsReclaim(t *testing.T) {
 
 func TestRelease_OnAbsentKeyIsNoop(t *testing.T) {
 	s := newStore()
-	if err := s.Release(context.Background(), "absent"); err != nil {
+	if err := s.Release(context.Background(), "absent", idemkit.Token(1)); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 }
 
-func TestSave_OnAbsentKeyIsNoop(t *testing.T) {
+func TestRelease_WithMismatchingTokenIsNoop(t *testing.T) {
 	s := newStore()
-	if err := s.Save(context.Background(), "absent", &idemkit.Result{StatusCode: 200}); err != nil {
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	if err := s.Release(ctx, "k", tok+1); err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	state, _, _ := s.Begin(context.Background(), "absent", []byte{1})
+
+	state, _, _, _ := s.Begin(ctx, "k", []byte{1})
+	if state != idemkit.StateInFlight {
+		t.Fatalf("state: %v, want StateInFlight (Release with wrong token must not delete)", state)
+	}
+}
+
+func TestSave_OnAbsentKeyReturnsTokenMismatch(t *testing.T) {
+	s := newStore()
+	err := s.Save(context.Background(), "absent", idemkit.Token(1), &idemkit.Result{StatusCode: 200})
+	if !errors.Is(err, idemkit.ErrTokenMismatch) {
+		t.Fatalf("err: %v, want ErrTokenMismatch", err)
+	}
+	state, _, _, _ := s.Begin(context.Background(), "absent", []byte{1})
 	if state != idemkit.StateFresh {
-		t.Fatalf("state: %v, want StateFresh (Save on absent must not create an entry)", state)
+		t.Fatalf("state: %v, want StateFresh (failed Save must not create an entry)", state)
+	}
+}
+
+func TestSave_WithMismatchingTokenReturnsErrTokenMismatch(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	err := s.Save(ctx, "k", tok+1, &idemkit.Result{StatusCode: 200})
+	if !errors.Is(err, idemkit.ErrTokenMismatch) {
+		t.Fatalf("err: %v, want ErrTokenMismatch", err)
+	}
+
+	state, _, _, _ := s.Begin(ctx, "k", []byte{1})
+	if state != idemkit.StateInFlight {
+		t.Fatalf("state: %v, want StateInFlight (failed Save must not mutate entry)", state)
+	}
+}
+
+func TestSave_AfterReclaimByOtherCallerReturnsErrTokenMismatch(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+
+	_, _, tokA, _ := s.Begin(ctx, "k", []byte{1})
+	if err := s.Release(ctx, "k", tokA); err != nil {
+		t.Fatal(err)
+	}
+	_, _, tokB, _ := s.Begin(ctx, "k", []byte{2})
+	if tokA == tokB {
+		t.Fatal("expected distinct tokens for reclaim")
+	}
+
+	err := s.Save(ctx, "k", tokA, &idemkit.Result{StatusCode: 200})
+	if !errors.Is(err, idemkit.ErrTokenMismatch) {
+		t.Fatalf("A's late Save: err=%v, want ErrTokenMismatch", err)
+	}
+
+	bResult := &idemkit.Result{StatusCode: 201}
+	if err := s.Save(ctx, "k", tokB, bResult); err != nil {
+		t.Fatalf("B's Save: %v", err)
+	}
+
+	state, got, _, _ := s.Begin(ctx, "k", []byte{2})
+	if state != idemkit.StateDone {
+		t.Fatalf("state: %v, want StateDone", state)
+	}
+	if !reflect.DeepEqual(got, bResult) {
+		t.Fatalf("result: %#v, want B's result %#v", got, bResult)
+	}
+}
+
+func TestSave_InputClonedSoCallerMutationDoesNotCorruptCache(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	input := &idemkit.Result{
+		StatusCode: 200,
+		Header:     http.Header{"X-Tag": []string{"original"}},
+		Body:       []byte("body"),
+	}
+	if err := s.Save(ctx, "k", tok, input); err != nil {
+		t.Fatal(err)
+	}
+
+	input.StatusCode = 500
+	input.Header.Set("X-Tag", "mutated")
+	input.Body[0] = 'X'
+
+	got, err := s.Wait(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StatusCode != 200 {
+		t.Fatalf("StatusCode: %d, want 200 (caller mutation leaked)", got.StatusCode)
+	}
+	if got.Header.Get("X-Tag") != "original" {
+		t.Fatalf("X-Tag: %q, want \"original\"", got.Header.Get("X-Tag"))
+	}
+	if string(got.Body) != "body" {
+		t.Fatalf("Body: %q, want \"body\"", got.Body)
+	}
+}
+
+func TestBegin_OutputClonedSoCallerMutationDoesNotCorruptCache(t *testing.T) {
+	s := newStore()
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	saved := &idemkit.Result{
+		StatusCode: 200,
+		Header:     http.Header{"X-Tag": []string{"original"}},
+		Body:       []byte("body"),
+	}
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	_, got1, _, _ := s.Begin(ctx, "k", []byte{1})
+	got1.Body[0] = 'X'
+	got1.Header.Set("X-Tag", "tampered")
+
+	_, got2, _, _ := s.Begin(ctx, "k", []byte{1})
+	if string(got2.Body) != "body" {
+		t.Fatalf("second Begin saw tampered body: %q", got2.Body)
+	}
+	if got2.Header.Get("X-Tag") != "original" {
+		t.Fatalf("second Begin saw tampered header: %q", got2.Header.Get("X-Tag"))
 	}
 }
 
@@ -310,13 +466,13 @@ func TestLockTimeout_ExpiredInFlightIsReclaimable(t *testing.T) {
 	clock := newFakeClock()
 	s := newStoreWithClock(clock)
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	if _, _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 
 	clock.Advance(31 * time.Second)
 
-	state, _, err := s.Begin(ctx, "k", []byte{2})
+	state, _, _, err := s.Begin(ctx, "k", []byte{2})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -329,13 +485,13 @@ func TestLockTimeout_NotExpiredYetStillInFlight(t *testing.T) {
 	clock := newFakeClock()
 	s := newStoreWithClock(clock)
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	if _, _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 
 	clock.Advance(29 * time.Second)
 
-	state, _, err := s.Begin(ctx, "k", []byte{1})
+	state, _, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -348,16 +504,17 @@ func TestTTL_ExpiredDoneEntryIsReclaimable(t *testing.T) {
 	clock := newFakeClock()
 	s := newStoreWithClock(clock)
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Save(ctx, "k", &idemkit.Result{StatusCode: 200}); err != nil {
+	if err := s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200}); err != nil {
 		t.Fatal(err)
 	}
 
 	clock.Advance(2 * time.Hour)
 
-	state, _, err := s.Begin(ctx, "k", []byte{1})
+	state, _, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -370,25 +527,26 @@ func TestTTL_NotExpiredYetStillDone(t *testing.T) {
 	clock := newFakeClock()
 	s := newStoreWithClock(clock)
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 	saved := &idemkit.Result{StatusCode: 200}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
 
 	clock.Advance(59 * time.Minute)
 
-	state, got, err := s.Begin(ctx, "k", []byte{1})
+	state, got, _, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if state != idemkit.StateDone {
 		t.Fatalf("state: %v, want StateDone (TTL still valid)", state)
 	}
-	if got != saved {
-		t.Fatalf("result: %v, want saved", got)
+	if !reflect.DeepEqual(got, saved) {
+		t.Fatalf("result: %#v, want %#v", got, saved)
 	}
 }
 
@@ -406,7 +564,7 @@ func TestConcurrentClaim_ExactlyOneSeesFresh(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			state, _, err := s.Begin(ctx, "k", []byte{1})
+			state, _, _, err := s.Begin(ctx, "k", []byte{1})
 			if err != nil {
 				t.Errorf("Begin: %v", err)
 				return
@@ -435,7 +593,8 @@ func TestConcurrentClaim_ExactlyOneSeesFresh(t *testing.T) {
 func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	s := newStore()
 	ctx := context.Background()
-	if _, _, err := s.Begin(ctx, "k", []byte{1}); err != nil {
+	_, _, tok, err := s.Begin(ctx, "k", []byte{1})
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -458,7 +617,7 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	saved := &idemkit.Result{StatusCode: 200}
-	if err := s.Save(ctx, "k", saved); err != nil {
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
 		t.Fatal(err)
 	}
 
@@ -468,8 +627,8 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	count := 0
 	for got := range results {
 		count++
-		if got != saved {
-			t.Errorf("waiter received %v, want saved", got)
+		if !reflect.DeepEqual(got, saved) {
+			t.Errorf("waiter received %#v, want %#v", got, saved)
 		}
 	}
 	if count != waiters {
@@ -480,14 +639,14 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 func TestNew_ZeroConfigAppliesDefaults(t *testing.T) {
 	s := mem.New(mem.Config{})
 	ctx := context.Background()
-	state, _, err := s.Begin(ctx, "k", []byte{1})
+	state, _, tok, err := s.Begin(ctx, "k", []byte{1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if state != idemkit.StateFresh {
 		t.Fatalf("state: %v, want StateFresh", state)
 	}
-	if err := s.Save(ctx, "k", &idemkit.Result{StatusCode: 200}); err != nil {
+	if err := s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -499,7 +658,7 @@ func BenchmarkBegin_Fresh(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = s.Begin(ctx, strconv.Itoa(i), hash)
+		_, _, _, _ = s.Begin(ctx, strconv.Itoa(i), hash)
 	}
 }
 
@@ -507,12 +666,12 @@ func BenchmarkBegin_Done(b *testing.B) {
 	s := mem.New(mem.Config{})
 	ctx := context.Background()
 	hash := make([]byte, 32)
-	_, _, _ = s.Begin(ctx, "k", hash)
-	_ = s.Save(ctx, "k", &idemkit.Result{StatusCode: 200, Body: []byte("ok")})
+	_, _, tok, _ := s.Begin(ctx, "k", hash)
+	_ = s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200, Body: []byte("ok")})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = s.Begin(ctx, "k", hash)
+		_, _, _, _ = s.Begin(ctx, "k", hash)
 	}
 }
 
@@ -520,13 +679,13 @@ func BenchmarkBegin_DoneParallel(b *testing.B) {
 	s := mem.New(mem.Config{})
 	ctx := context.Background()
 	hash := make([]byte, 32)
-	_, _, _ = s.Begin(ctx, "k", hash)
-	_ = s.Save(ctx, "k", &idemkit.Result{StatusCode: 200, Body: []byte("ok")})
+	_, _, tok, _ := s.Begin(ctx, "k", hash)
+	_ = s.Save(ctx, "k", tok, &idemkit.Result{StatusCode: 200, Body: []byte("ok")})
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, _, _ = s.Begin(ctx, "k", hash)
+			_, _, _, _ = s.Begin(ctx, "k", hash)
 		}
 	})
 }
@@ -540,7 +699,7 @@ func BenchmarkBegin_Save_Roundtrip(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := strconv.Itoa(i)
-		_, _, _ = s.Begin(ctx, key, hash)
-		_ = s.Save(ctx, key, res)
+		_, _, tok, _ := s.Begin(ctx, key, hash)
+		_ = s.Save(ctx, key, tok, res)
 	}
 }

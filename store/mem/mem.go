@@ -22,9 +22,10 @@ type Config struct {
 }
 
 type Store struct {
-	cfg     Config
-	mu      sync.Mutex
-	entries map[string]*entry
+	cfg       Config
+	mu        sync.Mutex
+	entries   map[string]*entry
+	nextToken uint64
 }
 
 type entry struct {
@@ -33,6 +34,7 @@ type entry struct {
 	result    *idemkit.Result
 	expiresAt time.Time
 	waiters   chan struct{}
+	token     idemkit.Token
 }
 
 func New(cfg Config) *Store {
@@ -48,20 +50,23 @@ func New(cfg Config) *Store {
 	return &Store{cfg: cfg, entries: make(map[string]*entry)}
 }
 
-func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit.State, *idemkit.Result, error) {
+func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit.State, *idemkit.Result, idemkit.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := s.cfg.Clock()
 	e, ok := s.lookupLocked(key, now)
 	if !ok {
+		s.nextToken++
+		tok := idemkit.Token(s.nextToken)
 		s.entries[key] = &entry{
 			state:     idemkit.StateInFlight,
 			bodyHash:  slices.Clone(bodyHash),
 			expiresAt: now.Add(s.cfg.LockTimeout),
 			waiters:   make(chan struct{}),
+			token:     tok,
 		}
-		return idemkit.StateFresh, nil, nil
+		return idemkit.StateFresh, nil, tok, nil
 	}
 
 	var mismatch error
@@ -70,9 +75,9 @@ func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit
 	}
 
 	if e.state == idemkit.StateInFlight {
-		return idemkit.StateInFlight, nil, mismatch
+		return idemkit.StateInFlight, nil, 0, mismatch
 	}
-	return idemkit.StateDone, e.result, mismatch
+	return idemkit.StateDone, e.result.Clone(), 0, mismatch
 }
 
 func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
@@ -83,7 +88,7 @@ func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
 		return nil, nil
 	}
 	if e.state == idemkit.StateDone {
-		res := e.result
+		res := e.result.Clone()
 		s.mu.Unlock()
 		return res, nil
 	}
@@ -103,21 +108,21 @@ func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
 		return nil, nil
 	}
 	if e.state == idemkit.StateDone {
-		return e.result, nil
+		return e.result.Clone(), nil
 	}
 	return nil, nil
 }
 
-func (s *Store) Save(ctx context.Context, key string, result *idemkit.Result) error {
+func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, result *idemkit.Result) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok {
-		return nil
+	if !ok || e.token != token {
+		return idemkit.ErrTokenMismatch
 	}
 	e.state = idemkit.StateDone
-	e.result = result
+	e.result = result.Clone()
 	e.expiresAt = s.cfg.Clock().Add(s.cfg.TTL)
 	if e.waiters != nil {
 		close(e.waiters)
@@ -126,12 +131,12 @@ func (s *Store) Save(ctx context.Context, key string, result *idemkit.Result) er
 	return nil
 }
 
-func (s *Store) Release(ctx context.Context, key string) error {
+func (s *Store) Release(ctx context.Context, key string, token idemkit.Token) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok {
+	if !ok || e.token != token {
 		return nil
 	}
 	if e.waiters != nil {
