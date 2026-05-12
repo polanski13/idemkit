@@ -96,26 +96,49 @@ Polling-based in v0.2 (default 100 ms). On each tick, query the row's state filt
 
 Tight loop on `ctx.Done()` exits cleanly with `ctx.Err()`.
 
-`LISTEN/NOTIFY` is documented in v0.3 as opt-in. It requires a dedicated `pgx.Conn` outside `pgxpool` (`LISTEN` is connection-state) — operational cost most callers don't want by default. Polling at 100 ms is good enough for the latencies idempotency targets.
+LISTEN/NOTIFY overlay is opt-in via `Config.ListenConn` — see "LISTEN/NOTIFY overlay" below. Polling at 100 ms is good enough for the latencies idempotency targets on its own; LISTEN is a latency hint, not a correctness requirement.
 
 ### Save
 
 ```sql
-UPDATE idemkit_keys
-SET state = $1, response_code = $2, response_headers = $3, response_body = $4,
-    completed_at = NOW(), expires_at = NOW() + ($5 * INTERVAL '1 second')
-WHERE key = $6 AND token = $7
+WITH upd AS (
+    UPDATE idemkit_keys
+    SET state = $1, response_code = $2, response_headers = $3, response_body = $4,
+        completed_at = NOW(), expires_at = NOW() + ($5 * INTERVAL '1 millisecond')
+    WHERE key = $6 AND token = $7
+    RETURNING 1
+)
+SELECT CASE WHEN $8 != '' THEN pg_notify($8, $6) END FROM upd
 ```
 
-If `RowsAffected() == 0` → `ErrTokenMismatch`. Same semantics as `mem.Store`: another caller reclaimed the key, our token is stale.
+If the inner UPDATE matches 0 rows, the outer SELECT returns 0 rows and `RowsAffected() == 0` → `ErrTokenMismatch`. Same semantics as `mem.Store`: another caller reclaimed the key, our token is stale.
+
+`$8` is the LISTEN channel name (passed as `""` when the overlay is disabled). The `CASE WHEN` short-circuit means `pg_notify` is not called when the channel is empty — same set of SQL constants covers both modes.
 
 ### Release
 
 ```sql
-DELETE FROM idemkit_keys WHERE key = $1 AND token = $2
+WITH del AS (
+    DELETE FROM idemkit_keys WHERE key = $1 AND token = $2 RETURNING 1
+)
+SELECT CASE WHEN $3 != '' THEN pg_notify($3, $1) END FROM del
 ```
 
-`RowsAffected()` is not checked — Release is idempotent. Absent or mismatched-token both succeed silently.
+`RowsAffected()` is not checked — Release is idempotent. Absent or mismatched-token both succeed silently. The conditional `pg_notify` follows the same pattern as Save.
+
+### LISTEN/NOTIFY overlay
+
+When `Config.ListenConn` is a non-nil dedicated `*pgx.Conn`, `New` issues `LISTEN idemkit_notify` on it under a 5 s timeout and spawns a listener goroutine that calls `WaitForNotification(ctx)` in a loop, dispatching each notification's payload (the bare key) to in-process waiters registered by `Wait`. If the initial `LISTEN` fails, the store silently degrades to polling-only — same as runtime listener-conn errors.
+
+**Why a dedicated `*pgx.Conn`.** `LISTEN` is connection-state in PostgreSQL: a pooled connection returned to `pgxpool` and handed to another query mid-LISTEN would lose the subscription. The store therefore requires the caller to supply a separately-dialed `*pgx.Conn` it doesn't multiplex with anything else.
+
+**Why polling stays.** The listener can drop (network blip, server restart, conn pool churn) and lose any notifications emitted during the gap — `pg_notify` is delivered at commit time and not persisted thereafter. Polling at `PollInterval` remains the source of truth; LISTEN is a latency optimization that short-circuits the polling tick when a relevant event arrives. The architecture cannot become silently incorrect by losing notifications.
+
+**Wait integration.** Same nil-channel idiom as `store/redis`: a `var notify chan struct{}` is registered with the listener when the overlay is enabled and stays nil otherwise. The probe loop's `select` includes a `case <-notify` branch that simply never fires when notify is nil. One select block covers both modes.
+
+**Lifecycle.** `Store.Close()` cancels the listener's run context (`WaitForNotification` returns with the cancellation error) and waits for the goroutine `done` chan. Idempotent via `sync.Once`; no-op when `ListenConn` is unset. The store does **not** close the caller's `*pgx.Conn` — that lifecycle stays with the caller. Recommended pattern: `defer store.Close()` followed by `defer listenConn.Close(ctx)`.
+
+**Channel and payload.** Channel name is fixed (`idemkit_notify`); pg has no `KeyPrefix` analogue because keys live in the `idemkit_keys` table, not the channel namespace. Payload is the bare key, well under PostgreSQL's 8000-byte NOTIFY payload limit for any realistic idempotency-key value. The store side issues `LISTEN` (not `PSUBSCRIBE`-style pattern matching), so SQL identifier escaping is irrelevant — the channel name is a constant.
 
 ### Token generation
 

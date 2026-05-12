@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +21,7 @@ const (
 	defaultTTL          = 24 * time.Hour
 	defaultLockTimeout  = 30 * time.Second
 	defaultPollInterval = 100 * time.Millisecond
+	notifyChannel       = "idemkit_notify"
 
 	stateInFlight int16 = 0
 	stateDone     int16 = 1
@@ -32,11 +34,14 @@ type Config struct {
 	TTL          time.Duration
 	LockTimeout  time.Duration
 	PollInterval time.Duration
+	ListenConn   *pgx.Conn
 }
 
 type Store struct {
-	pool *pgxpool.Pool
-	cfg  Config
+	pool      *pgxpool.Pool
+	cfg       Config
+	listener  *listener
+	closeOnce sync.Once
 }
 
 func New(pool *pgxpool.Pool, cfg Config) *Store {
@@ -49,7 +54,34 @@ func New(pool *pgxpool.Pool, cfg Config) *Store {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = defaultPollInterval
 	}
-	return &Store{pool: pool, cfg: cfg}
+	s := &Store{pool: pool, cfg: cfg}
+	if cfg.ListenConn != nil {
+		startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		l, err := newListener(startCtx, cfg.ListenConn, notifyChannel)
+		if err == nil {
+			s.listener = l
+		}
+	}
+	return s
+}
+
+func (s *Store) Close() error {
+	if s.listener == nil {
+		return nil
+	}
+	var err error
+	s.closeOnce.Do(func() {
+		err = s.listener.close()
+	})
+	return err
+}
+
+func (s *Store) notifyArg() string {
+	if s.listener == nil {
+		return ""
+	}
+	return notifyChannel
 }
 
 func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
@@ -89,17 +121,26 @@ RETURNING token
 `
 
 const saveSQL = `
-UPDATE idemkit_keys
-SET state = $1,
-    response_code = $2,
-    response_headers = $3,
-    response_body = $4,
-    completed_at = NOW(),
-    expires_at = NOW() + ($5 * INTERVAL '1 millisecond')
-WHERE key = $6 AND token = $7
+WITH upd AS (
+    UPDATE idemkit_keys
+    SET state = $1,
+        response_code = $2,
+        response_headers = $3,
+        response_body = $4,
+        completed_at = NOW(),
+        expires_at = NOW() + ($5 * INTERVAL '1 millisecond')
+    WHERE key = $6 AND token = $7
+    RETURNING 1
+)
+SELECT CASE WHEN $8 != '' THEN pg_notify($8, $6) END FROM upd
 `
 
-const releaseSQL = `DELETE FROM idemkit_keys WHERE key = $1 AND token = $2`
+const releaseSQL = `
+WITH del AS (
+    DELETE FROM idemkit_keys WHERE key = $1 AND token = $2 RETURNING 1
+)
+SELECT CASE WHEN $3 != '' THEN pg_notify($3, $1) END FROM del
+`
 
 const probeSQL = `
 SELECT state, response_code, response_headers, response_body
@@ -177,6 +218,11 @@ func (s *Store) Begin(ctx context.Context, key string, bodyHash []byte) (idemkit
 }
 
 func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
+	var notify chan struct{}
+	if s.listener != nil {
+		notify = s.listener.register(key)
+		defer s.listener.unregister(key, notify)
+	}
 	for {
 		result, terminal, err := s.probe(ctx, key)
 		if err != nil {
@@ -188,6 +234,7 @@ func (s *Store) Wait(ctx context.Context, key string) (*idemkit.Result, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-notify:
 		case <-time.After(s.cfg.PollInterval):
 		}
 	}
@@ -236,6 +283,7 @@ func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, resul
 		ttlMillis,
 		key,
 		int64(token),
+		s.notifyArg(),
 	)
 	if err != nil {
 		return fmt.Errorf("idemkit/pg: save: %w", err)
@@ -247,7 +295,7 @@ func (s *Store) Save(ctx context.Context, key string, token idemkit.Token, resul
 }
 
 func (s *Store) Release(ctx context.Context, key string, token idemkit.Token) error {
-	_, err := s.pool.Exec(ctx, releaseSQL, key, int64(token))
+	_, err := s.pool.Exec(ctx, releaseSQL, key, int64(token), s.notifyArg())
 	if err != nil {
 		return fmt.Errorf("idemkit/pg: release: %w", err)
 	}

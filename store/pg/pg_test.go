@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/polanski13/idemkit"
@@ -528,6 +529,253 @@ func TestConcurrentWaiters_AllReceiveSavedResult(t *testing.T) {
 	}
 	if count != waiters {
 		t.Fatalf("waiter count: %d, want %d", count, waiters)
+	}
+}
+
+func newListenStore(t *testing.T, pollInterval time.Duration) *pg.Store {
+	t.Helper()
+	if pkgPool == nil {
+		t.Skip("set IDEMKIT_PG_TEST_URL to run pg integration tests")
+	}
+	if _, err := pkgPool.Exec(context.Background(), "TRUNCATE idemkit_keys"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	url := os.Getenv("IDEMKIT_PG_TEST_URL")
+	listenConn, err := pgx.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("dial listen conn: %v", err)
+	}
+	s := pg.New(pkgPool, pg.Config{
+		TTL:          time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: pollInterval,
+		ListenConn:   listenConn,
+	})
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+		if err := listenConn.Close(context.Background()); err != nil {
+			t.Errorf("listen conn Close: %v", err)
+		}
+	})
+	return s
+}
+
+func TestListen_WakesWaiterOnSave(t *testing.T) {
+	s := newListenStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	type out struct {
+		res *idemkit.Result
+		err error
+		dur time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		started := time.Now()
+		res, err := s.Wait(ctx, "k")
+		done <- out{res, err, time.Since(started)}
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("err: %v", got.err)
+		}
+		if !reflect.DeepEqual(got.res, saved) {
+			t.Fatalf("result: %#v, want %#v", got.res, saved)
+		}
+		if got.dur >= 500*time.Millisecond {
+			t.Fatalf("Wait took %v, expected LISTEN-driven wakeup well under PollInterval (5s)", got.dur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after Save")
+	}
+}
+
+func TestListen_WakesWaiterOnRelease(t *testing.T) {
+	s := newListenStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	type out struct {
+		res *idemkit.Result
+		err error
+		dur time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		started := time.Now()
+		res, err := s.Wait(ctx, "k")
+		done <- out{res, err, time.Since(started)}
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+
+	if err := s.Release(ctx, "k", tok); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("err: %v", got.err)
+		}
+		if got.res != nil {
+			t.Fatalf("result: %v, want nil after Release", got.res)
+		}
+		if got.dur >= 500*time.Millisecond {
+			t.Fatalf("Wait took %v, expected LISTEN-driven wakeup well under PollInterval (5s)", got.dur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after Release")
+	}
+}
+
+func TestListen_ConcurrentWaitersAllWake(t *testing.T) {
+	s := newListenStore(t, 5*time.Second)
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	const waiters = 10
+	results := make(chan *idemkit.Result, waiters)
+	var wg sync.WaitGroup
+	wg.Add(waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			defer wg.Done()
+			res, err := s.Wait(ctx, "k")
+			if err != nil {
+				t.Errorf("Wait: %v", err)
+				return
+			}
+			results <- res
+		}()
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	started := time.Now()
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(started)
+	close(results)
+
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("waiters took %v to wake, expected LISTEN-driven wakeup well under PollInterval (5s)", elapsed)
+	}
+
+	count := 0
+	for got := range results {
+		count++
+		if !reflect.DeepEqual(got, saved) {
+			t.Errorf("waiter received %#v, want %#v", got, saved)
+		}
+	}
+	if count != waiters {
+		t.Fatalf("waiter count: %d, want %d", count, waiters)
+	}
+}
+
+func TestListen_WaitHonorsCtxCancellation(t *testing.T) {
+	s := newListenStore(t, 5*time.Second)
+	if _, _, _, err := s.Begin(context.Background(), "k", []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.Wait(ctx, "k")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err: %v, want context.Canceled", err)
+	}
+}
+
+func TestListen_CloseIsIdempotent(t *testing.T) {
+	if pkgPool == nil {
+		t.Skip("set IDEMKIT_PG_TEST_URL to run pg integration tests")
+	}
+	url := os.Getenv("IDEMKIT_PG_TEST_URL")
+	listenConn, err := pgx.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("dial listen conn: %v", err)
+	}
+	defer listenConn.Close(context.Background())
+
+	s := pg.New(pkgPool, pg.Config{ListenConn: listenConn})
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestListen_CloseWithoutListenConnIsNoop(t *testing.T) {
+	if pkgPool == nil {
+		t.Skip("set IDEMKIT_PG_TEST_URL to run pg integration tests")
+	}
+	s := pg.New(pkgPool, pg.Config{})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close on non-listen store: %v", err)
+	}
+}
+
+func TestListen_BrokenConnDegradesToPolling(t *testing.T) {
+	if pkgPool == nil {
+		t.Skip("set IDEMKIT_PG_TEST_URL to run pg integration tests")
+	}
+	url := os.Getenv("IDEMKIT_PG_TEST_URL")
+	brokenConn, err := pgx.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = brokenConn.Close(context.Background())
+
+	if _, err := pkgPool.Exec(context.Background(), "TRUNCATE idemkit_keys"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	s := pg.New(pkgPool, pg.Config{
+		TTL:          time.Hour,
+		LockTimeout:  30 * time.Second,
+		PollInterval: 50 * time.Millisecond,
+		ListenConn:   brokenConn,
+	})
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	_, _, tok, _ := s.Begin(ctx, "k", []byte{1})
+
+	done := make(chan struct{}, 1)
+	go func() {
+		_, _ = s.Wait(ctx, "k")
+		done <- struct{}{}
+	}()
+
+	saved := &idemkit.Result{StatusCode: 200, Body: []byte("ok")}
+	if err := s.Save(ctx, "k", tok, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Wait did not return after Save (polling backstop expected)")
 	}
 }
 
